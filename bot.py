@@ -84,6 +84,12 @@ async def setup():
         INDEX idx_due (status, scheduled_utc),
         INDEX idx_owner (owner_id, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+    await query("""CREATE TABLE IF NOT EXISTS registered_groups (
+        chat_id BIGINT PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        active TINYINT(1) NOT NULL DEFAULT 1,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
     # Recover work claimed before an unexpected process restart.
     await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
 
@@ -140,8 +146,9 @@ async def check_permission(client, message, target, actor_id=None):
         raise ValueError("The bot must be an admin in the destination.")
     if user_member.status not in admin_states:
         raise ValueError("You must be an admin in the destination.")
-    if target and bot_member.status == ChatMemberStatus.ADMINISTRATOR:
-        if not getattr(bot_member.privileges, "can_post_messages", True):
+    chat = await client.get_chat(target)
+    if chat.type.value == "channel" and bot_member.status == ChatMemberStatus.ADMINISTRATOR:
+        if not getattr(bot_member.privileges, "can_post_messages", False):
             raise ValueError("The bot needs permission to post messages.")
     return target
 
@@ -291,12 +298,100 @@ async def cancel(_, message):
 
 
 
+
+async def save_group(chat, active=True):
+    if chat.type.value not in ("group", "supergroup"):
+        return
+    await query(
+        """INSERT INTO registered_groups (chat_id,title,active)
+        VALUES (%s,%s,%s)
+        ON DUPLICATE KEY UPDATE title=VALUES(title),active=VALUES(active)""",
+        (chat.id, (chat.title or "Unnamed Group")[:255], int(active)),
+    )
+
+
+@app.on_chat_member_updated()
+async def track_bot_membership(client, update):
+    try:
+        if not update.new_chat_member or not update.chat:
+            return
+        member = update.new_chat_member
+        me = await client.get_me()
+        if not member.user or member.user.id != me.id:
+            return
+        active = member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+        await save_group(update.chat, active=active)
+    except Exception:
+        log.exception("Could not track group membership")
+
+
+@app.on_message(filters.group & filters.command("register"))
+async def register_group(client, message):
+    if not message.from_user:
+        return
+    try:
+        await check_permission(client, message, message.chat.id)
+        await save_group(message.chat)
+        await message.reply_text("✅ Group registered. Select it from the bot's private group picker.")
+    except (ValueError, RPCError) as exc:
+        await message.reply_text("❌ " + str(exc))
+
+
+async def group_picker(client, user_id):
+    rows = await query(
+        "SELECT chat_id,title FROM registered_groups WHERE active=1 ORDER BY title LIMIT 80",
+        mode="all",
+    )
+    available = []
+    me = await client.get_me()
+    for row in rows:
+        try:
+            bot = await client.get_chat_member(row["chat_id"], me.id)
+            user = await client.get_chat_member(row["chat_id"], user_id)
+            admins = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+            if bot.status in admins and user.status in admins:
+                available.append(row)
+        except RPCError:
+            continue
+    return available
+
+
+def group_keyboard(groups):
+    buttons = [
+        [InlineKeyboardButton("👥 " + row["title"][:45], callback_data=f"ui:group:{row['chat_id']}")]
+        for row in groups[:40]
+    ]
+    buttons.append([InlineKeyboardButton("🔄 Refresh Groups", callback_data="ui:refresh")])
+    buttons.append([InlineKeyboardButton("✍️ Enter ID Manually", callback_data="ui:manual")])
+    buttons.append([InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def target_selected(message, state, target):
+    state["target"] = target
+    if state["mode"] == "schedule":
+        state["step"] = "date"
+        return await message.reply_text(
+            f"🕒 Send date/time ({TZ}):\nYYYY-MM-DD HH:MM",
+            reply_markup=cancel_menu(),
+        )
+    state["step"] = "confirm"
+    return await message.reply_text(
+        f"Publish to {target}?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Publish Now", callback_data="ui:publish")],
+            [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")],
+        ]),
+    )
+
+
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🖼 Create Post", callback_data="ui:create")],
         [InlineKeyboardButton("🗓 Schedule Post", callback_data="ui:schedule")],
         [InlineKeyboardButton("👁 Preview Demo", callback_data="ui:demo")],
         [InlineKeyboardButton("📋 Scheduled Posts", callback_data="ui:list")],
+        [InlineKeyboardButton("👥 My Groups", callback_data="ui:groups")],
         [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
     ])
 
@@ -327,6 +422,13 @@ async def menu_click(client, cb):
     if action == "home":
         sessions.pop(user.id, None)
         return await cb.message.reply_text("🏠 Main menu", reply_markup=main_menu())
+    if action in ("groups", "refresh"):
+        groups = await group_picker(client, user.id)
+        intro = ("👥 Select a group to post to:" if state and state.get("step") == "target"
+                 else "👥 Registered groups where you and the bot are admins:")
+        if not groups:
+            intro += "\nNo groups found. Add the bot as admin or send /register in an existing group."
+        return await cb.message.reply_text(intro, reply_markup=group_keyboard(groups))
     if action == "help":
         return await cb.message.reply_text(HELP, reply_markup=main_menu())
     if action == "list":
@@ -343,6 +445,22 @@ async def menu_click(client, cb):
     if action in ("create", "schedule", "demo"):
         sessions[user.id] = {"mode": action, "step": "media", "buttons": []}
         return await cb.message.reply_text("📸 Send a photo, video, document or text with its caption.", reply_markup=cancel_menu())
+    if action.startswith("group:"):
+        if not state or state.get("step") != "target":
+            return await cb.message.reply_text("Start a post first, then select a group.", reply_markup=main_menu())
+        try:
+            target = int(action.split(":", 1)[1])
+            registered = await query("SELECT chat_id FROM registered_groups WHERE chat_id=%s AND active=1", (target,), mode="one")
+            if not registered:
+                raise ValueError("Group is no longer registered.")
+            await check_permission(client, cb.message, target, actor_id=user.id)
+            return await target_selected(cb.message, state, target)
+        except (ValueError, RPCError) as exc:
+            return await cb.message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
+    if action == "manual":
+        if not state or state.get("step") != "target":
+            return await cb.message.reply_text("Start a post first.", reply_markup=main_menu())
+        return await cb.message.reply_text("Send @group or -100... group ID.", reply_markup=cancel_menu())
     if not state or "source" not in state:
         return await cb.message.reply_text("Start from the main menu.", reply_markup=main_menu())
     if action == "add":
@@ -359,7 +477,12 @@ async def menu_click(client, cb):
         return await cb.message.reply_text("👆 Preview above.", reply_markup=draft_menu())
     if action == "next":
         state["step"] = "target"
-        return await cb.message.reply_text("📢 Send @channel or -100... chat ID. You and the bot must be admins.", reply_markup=cancel_menu())
+        groups = await group_picker(client, user.id)
+        return await cb.message.reply_text(
+            "📢 Select a registered group, or enter a destination manually.\n"
+            "Missing a group? Send /register in that group.",
+            reply_markup=group_keyboard(groups),
+        )
     if state.get("step") != "confirm":
         return await cb.message.reply_text("Complete the earlier steps first.")
     try:
@@ -410,14 +533,7 @@ async def menu_input(client, message):
         if step == "target":
             target = parse_target(message.text.strip())
             await check_permission(client, message, target)
-            state["target"] = target
-            if state["mode"] == "schedule":
-                state["step"] = "date"
-                return await message.reply_text(f"🕒 Send date/time ({TZ}):\nYYYY-MM-DD HH:MM", reply_markup=cancel_menu())
-            state["step"] = "confirm"
-            return await message.reply_text(f"Publish to {target}?", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚀 Publish Now", callback_data="ui:publish")],
-                [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")]]))
+            return await target_selected(message, state, target)
         if step == "date":
             local = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
             due = local.astimezone(timezone.utc).replace(tzinfo=None)
