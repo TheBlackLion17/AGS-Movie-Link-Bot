@@ -38,3 +38,29 @@ To link the existing OTT bot, set `AUTOFILTER_USERNAME=agsautofilterbot` in **OT
 Update independently with `cd /opt/ags-movie-link && git pull --ff-only origin main && sudo systemctl restart ags-movie-link.service`.
 
 **Notes:** Only posts received after startup are indexed. No user session is required. Matching is heuristic; year-less or ambiguously named files may need manual checking. Avoid using the same bot token in two running services.
+
+## Rose-style movie previews
+
+Search and OTT deep links now display a movie detail card with a **📥 DOWNLOAD** inline button before sending the file. If multiple matches exist, the user first selects a version. Poster display is optional; without a valid Telegram photo file ID, the bot sends a formatted text preview.
+
+New channel file captions may include metadata on separate lines:
+
+```text
+Finding Her Edge 2025 1080p English.mkv
+Type: TV Series
+Rating: 3.9/5
+Genres: Drama, Romantic, Sport
+PosterFileID: TELEGRAM_PHOTO_FILE_ID
+```
+
+`PosterFileID` must be a valid Telegram photo file ID accessible to this bot (not a photo URL, message ID, or another bot's file ID). The existing file indexing policy is unchanged: only new document/video channel messages are indexed. Movie title, year, language and quality are inferred from the filename/caption when possible; rating and genres require explicit caption metadata. This feature does **not** automatically fetch IMDb or poster images.
+
+Deploy after reviewing the diff:
+
+```bash
+cd /opt/ags-movie-link
+git pull --ff-only origin main
+venv/bin/python -m py_compile bot.py
+sudo systemctl restart ags-movie-link.service
+sudo journalctl -u ags-movie-link.service -n 40 --no-pager -l
+```
