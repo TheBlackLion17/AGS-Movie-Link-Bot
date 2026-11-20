@@ -90,6 +90,9 @@ async def setup():
         active TINYINT(1) NOT NULL DEFAULT 1,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+    columns = await query("SHOW COLUMNS FROM registered_groups", mode="all")
+    if not any(row["Field"] == "chat_type" for row in columns):
+        await query("ALTER TABLE registered_groups ADD COLUMN chat_type VARCHAR(20) NOT NULL DEFAULT 'group'")
     # Recover work claimed before an unexpected process restart.
     await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
 
@@ -300,14 +303,29 @@ async def cancel(_, message):
 
 
 async def save_group(chat, active=True):
-    if chat.type.value not in ("group", "supergroup"):
+    if chat.type.value not in ("group", "supergroup", "channel"):
         return
     await query(
-        """INSERT INTO registered_groups (chat_id,title,active)
-        VALUES (%s,%s,%s)
-        ON DUPLICATE KEY UPDATE title=VALUES(title),active=VALUES(active)""",
-        (chat.id, (chat.title or "Unnamed Group")[:255], int(active)),
+        """INSERT INTO registered_groups (chat_id,title,active,chat_type)
+        VALUES (%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE title=VALUES(title),active=VALUES(active),chat_type=VALUES(chat_type)""",
+        (chat.id, (chat.title or "Unnamed Chat")[:255], int(active), chat.type.value),
     )
+
+
+@app.on_message(filters.private & filters.forwarded, group=2)
+async def register_forwarded_channel(client, message):
+    source = getattr(message, "forward_from_chat", None)
+    if not source or source.type.value != "channel":
+        return
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        await check_permission(client, message, source.id)
+        await save_group(source)
+        await message.reply_text("✅ Channel connected! Open Groups & Channels to select it.")
+    except (ValueError, RPCError) as exc:
+        await message.reply_text("❌ Channel not connected: " + str(exc))
 
 
 @app.on_chat_member_updated()
@@ -325,7 +343,7 @@ async def track_bot_membership(client, update):
         log.exception("Could not track group membership")
 
 
-@app.on_message(filters.group & filters.command("register"))
+@app.on_message((filters.group | filters.channel) & filters.command("register"))
 async def register_group(client, message):
     if not message.from_user:
         return
@@ -339,7 +357,7 @@ async def register_group(client, message):
 
 async def group_picker(client, user_id):
     rows = await query(
-        "SELECT chat_id,title FROM registered_groups WHERE active=1 ORDER BY title LIMIT 80",
+        "SELECT chat_id,title,chat_type FROM registered_groups WHERE active=1 ORDER BY title LIMIT 80",
         mode="all",
     )
     available = []
@@ -358,7 +376,7 @@ async def group_picker(client, user_id):
 
 def group_keyboard(groups):
     buttons = [
-        [InlineKeyboardButton("👥 " + row["title"][:45], callback_data=f"ui:group:{row['chat_id']}")]
+        [InlineKeyboardButton(("📢 " if row["chat_type"] == "channel" else "👥 ") + row["title"][:45], callback_data=f"ui:group:{row['chat_id']}")]
         for row in groups[:40]
     ]
     buttons.append([InlineKeyboardButton("🔄 Refresh Groups", callback_data="ui:refresh")])
@@ -391,8 +409,8 @@ def main_menu():
         [InlineKeyboardButton("🗓 Schedule Post", callback_data="ui:schedule")],
         [InlineKeyboardButton("👁 Preview Demo", callback_data="ui:demo")],
         [InlineKeyboardButton("📋 Scheduled Posts", callback_data="ui:list")],
-        [InlineKeyboardButton("👥 My Groups", callback_data="ui:groups")],
-        [InlineKeyboardButton("➕ Connect Group", callback_data="ui:connect")],
+        [InlineKeyboardButton("👥 Groups & Channels", callback_data="ui:groups")],
+        [InlineKeyboardButton("➕ Connect Group / Channel", callback_data="ui:connect")],
         [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
     ])
 
@@ -425,14 +443,15 @@ async def menu_click(client, cb):
         return await cb.message.reply_text("🏠 Main menu", reply_markup=main_menu())
     if action in ("groups", "refresh"):
         groups = await group_picker(client, user.id)
-        intro = ("👥 Select a group to post to:" if state and state.get("step") == "target"
-                 else "👥 Registered groups where you and the bot are admins:")
+        intro = ("👥 Select a group or channel to post to:" if state and state.get("step") == "target"
+                 else "👥 Registered groups and channels where you and the bot are admins:")
         if not groups:
-            intro += "\nNo groups found. Add the bot as admin or send /register in an existing group."
+            intro += "\nNo destinations found. Add the bot as admin or register an existing group/channel."
         return await cb.message.reply_text(intro, reply_markup=group_keyboard(groups))
     if action == "connect":
         me = await client.get_me()
         link = "https://t.me/" + me.username + "?startgroup=connect"
+        channel_link = "https://t.me/" + me.username + "?startchannel=connect&admin=post_messages"
         return await cb.message.reply_text(
             "➕ Connect a Telegram group\\n\\n"
             "Tap Select Group below and choose your group. "
@@ -444,6 +463,7 @@ async def menu_click(client, cb):
             "when a bot is already a member.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👥 Select Group in Telegram", url=link)],
+                [InlineKeyboardButton("📢 Select Channel in Telegram", url=channel_link)],
                 [InlineKeyboardButton("🔄 Refresh Groups", callback_data="ui:refresh")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="ui:home")],
             ]),
@@ -499,7 +519,7 @@ async def menu_click(client, cb):
         groups = await group_picker(client, user.id)
         return await cb.message.reply_text(
             "📢 Select a registered group, or enter a destination manually.\n"
-            "Missing a group? Send /register in that group.",
+            "Missing a group/channel? Forward a channel post to this bot to connect it.",
             reply_markup=group_keyboard(groups),
         )
     if state.get("step") != "confirm":
