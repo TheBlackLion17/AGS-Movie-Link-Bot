@@ -392,6 +392,7 @@ def main_menu():
         [InlineKeyboardButton("👁 Preview Demo", callback_data="ui:demo")],
         [InlineKeyboardButton("📋 Scheduled Posts", callback_data="ui:list")],
         [InlineKeyboardButton("👥 My Groups", callback_data="ui:groups")],
+        [InlineKeyboardButton("➕ Connect Group", callback_data="ui:connect")],
         [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
     ])
 
@@ -429,6 +430,24 @@ async def menu_click(client, cb):
         if not groups:
             intro += "\nNo groups found. Add the bot as admin or send /register in an existing group."
         return await cb.message.reply_text(intro, reply_markup=group_keyboard(groups))
+    if action == "connect":
+        me = await client.get_me()
+        link = "https://t.me/" + me.username + "?startgroup=connect"
+        return await cb.message.reply_text(
+            "➕ Connect a Telegram group\\n\\n"
+            "Tap Select Group below and choose your group. "
+            "Telegram will ask you to add the bot. Give the bot admin rights "
+            "so it can publish scheduled posts.\\n\\n"
+            "After adding it, tap Refresh Groups.\\n\\n"
+            "If the bot is already in your group, send /register inside "
+            "that group once; Telegram does not send a new join event "
+            "when a bot is already a member.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👥 Select Group in Telegram", url=link)],
+                [InlineKeyboardButton("🔄 Refresh Groups", callback_data="ui:refresh")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="ui:home")],
+            ]),
+        )
     if action == "help":
         return await cb.message.reply_text(HELP, reply_markup=main_menu())
     if action == "list":
