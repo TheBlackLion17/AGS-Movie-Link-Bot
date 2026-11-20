@@ -1,0 +1,16 @@
+[Unit]
+Description=AGS Movie Link Bot (independent)
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ags-movie-link
+EnvironmentFile=/opt/ags-movie-link/.env
+ExecStart=/opt/ags-movie-link/venv/bin/python /opt/ags-movie-link/bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
