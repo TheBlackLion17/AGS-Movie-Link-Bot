@@ -44,6 +44,7 @@ app = Client(
     bot_token=required("BOT_TOKEN"),
 )
 pool = None
+sessions = {}
 
 
 async def query(statement, params=(), mode=None):
@@ -124,13 +125,14 @@ def keyboard(buttons):
     ])
 
 
-async def check_permission(client, message, target):
-    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+async def check_permission(client, message, target, actor_id=None):
+    actor_id = actor_id or message.from_user.id
+    if ADMIN_IDS and actor_id not in ADMIN_IDS:
         raise ValueError("You are not authorized to use this bot.")
     try:
         me = await client.get_me()
         bot_member = await client.get_chat_member(target, me.id)
-        user_member = await client.get_chat_member(target, message.from_user.id)
+        user_member = await client.get_chat_member(target, actor_id)
     except RPCError as exc:
         raise ValueError("Cannot verify channel/group permissions. Add the bot as admin and try again.") from exc
     admin_states = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
@@ -166,7 +168,8 @@ HELP = (
 
 @app.on_message(filters.private & filters.command(["start", "help"]))
 async def start(_, message):
-    await message.reply_text(HELP, disable_web_page_preview=True)
+    sessions.pop(message.from_user.id, None)
+    await message.reply_text("🛠 AGS Post Manager — choose an action:", reply_markup=main_menu())
 
 
 @app.on_message(filters.private & filters.command("demo"))
@@ -285,6 +288,151 @@ async def cancel(_, message):
         (job_id, message.from_user.id),
     )
     await message.reply_text("✅ Cancelled." if changed else "Post not found or already processing.")
+
+
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼 Create Post", callback_data="ui:create")],
+        [InlineKeyboardButton("🗓 Schedule Post", callback_data="ui:schedule")],
+        [InlineKeyboardButton("👁 Preview Demo", callback_data="ui:demo")],
+        [InlineKeyboardButton("📋 Scheduled Posts", callback_data="ui:list")],
+        [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
+    ])
+
+
+def draft_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add URL Button", callback_data="ui:add")],
+        [InlineKeyboardButton("👁 Preview", callback_data="ui:preview"),
+         InlineKeyboardButton("➡️ Continue", callback_data="ui:next")],
+        [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")],
+    ])
+
+
+def cancel_menu():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")]])
+
+
+@app.on_callback_query(filters.regex(r"^ui:"))
+async def menu_click(client, cb):
+    user = cb.from_user
+    if not user or not cb.message or cb.message.chat.id != user.id:
+        return await cb.answer("Open the bot in private chat.", show_alert=True)
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        return await cb.answer("Not authorized.", show_alert=True)
+    await cb.answer()
+    action = cb.data[3:]
+    state = sessions.get(user.id)
+    if action == "home":
+        sessions.pop(user.id, None)
+        return await cb.message.reply_text("🏠 Main menu", reply_markup=main_menu())
+    if action == "help":
+        return await cb.message.reply_text(HELP, reply_markup=main_menu())
+    if action == "list":
+        rows = await query(
+            "SELECT id,target_chat,scheduled_utc FROM scheduled_posts WHERE owner_id=%s AND status='pending' ORDER BY scheduled_utc LIMIT 20",
+            (user.id,), mode="all")
+        lines = ["📋 Pending posts:"]
+        for row in rows:
+            local = row["scheduled_utc"].replace(tzinfo=timezone.utc).astimezone(TZ)
+            lines.append(f"#{row['id']} · {row['target_chat']} · {local:%Y-%m-%d %H:%M}")
+        if not rows:
+            lines.append("None")
+        return await cb.message.reply_text("\n".join(lines) + "\nUse /cancel ID to cancel.", reply_markup=main_menu())
+    if action in ("create", "schedule", "demo"):
+        sessions[user.id] = {"mode": action, "step": "media", "buttons": []}
+        return await cb.message.reply_text("📸 Send a photo, video, document or text with its caption.", reply_markup=cancel_menu())
+    if not state or "source" not in state:
+        return await cb.message.reply_text("Start from the main menu.", reply_markup=main_menu())
+    if action == "add":
+        state["step"] = "button"
+        return await cb.message.reply_text("🔗 Send a button:\nDOWNLOAD | https://example.com", reply_markup=cancel_menu())
+    if action in ("preview", "next") and (action == "preview" or state["mode"] == "demo"):
+        try:
+            await client.copy_message(user.id, user.id, state["source"], reply_markup=keyboard(state["buttons"]))
+        except RPCError:
+            return await cb.message.reply_text("❌ Preview failed. Is the original post still available?")
+        if action == "next":
+            sessions.pop(user.id, None)
+            return await cb.message.reply_text("✅ Demo complete. Nothing published.", reply_markup=main_menu())
+        return await cb.message.reply_text("👆 Preview above.", reply_markup=draft_menu())
+    if action == "next":
+        state["step"] = "target"
+        return await cb.message.reply_text("📢 Send @channel or -100... chat ID. You and the bot must be admins.", reply_markup=cancel_menu())
+    if state.get("step") != "confirm":
+        return await cb.message.reply_text("Complete the earlier steps first.")
+    try:
+        await check_permission(client, cb.message, state["target"], actor_id=user.id)
+        if action == "publish" and state["mode"] == "create":
+            sent = await client.copy_message(state["target"], user.id, state["source"], reply_markup=keyboard(state["buttons"]))
+            sessions.pop(user.id, None)
+            return await cb.message.reply_text(f"✅ Published! Message ID: {sent.id}", reply_markup=main_menu())
+        if action == "save" and state["mode"] == "schedule":
+            await query(
+                "INSERT INTO scheduled_posts (owner_id,source_chat,source_message,target_chat,buttons_json,scheduled_utc) VALUES (%s,%s,%s,%s,%s,%s)",
+                (user.id, user.id, state["source"], str(state["target"]), json.dumps(state["buttons"]), state["due"]))
+            sessions.pop(user.id, None)
+            return await cb.message.reply_text("✅ Post scheduled.", reply_markup=main_menu())
+    except (ValueError, RPCError, FloodWait) as exc:
+        return await cb.message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
+    except Exception:
+        log.exception("Menu action failed")
+        return await cb.message.reply_text("❌ Action failed. Check VPS logs.")
+
+
+@app.on_message(filters.private & ~filters.command(["start", "help", "demo", "buttons", "schedule", "scheduled", "cancel"]), group=1)
+async def menu_input(client, message):
+    if not message.from_user:
+        return
+    state = sessions.get(message.from_user.id)
+    if not state:
+        return
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        return
+    step = state["step"]
+    if step == "media":
+        if not (message.text or message.photo or message.video or message.document):
+            return await message.reply_text("Send a text, photo, video or document.")
+        state["source"] = message.id
+        state["step"] = "ready"
+        return await message.reply_text("✅ Post received. Add buttons or continue.", reply_markup=draft_menu())
+    if not message.text:
+        return await message.reply_text("Send text for this step.")
+    try:
+        if step == "button":
+            new = parse_buttons([message.text])
+            if len(state["buttons"]) + len(new) > 20:
+                raise ValueError("Maximum 20 buttons.")
+            state["buttons"].extend(new)
+            state["step"] = "ready"
+            return await message.reply_text(f"✅ Button added ({len(state['buttons'])}/20).", reply_markup=draft_menu())
+        if step == "target":
+            target = parse_target(message.text.strip())
+            await check_permission(client, message, target)
+            state["target"] = target
+            if state["mode"] == "schedule":
+                state["step"] = "date"
+                return await message.reply_text(f"🕒 Send date/time ({TZ}):\nYYYY-MM-DD HH:MM", reply_markup=cancel_menu())
+            state["step"] = "confirm"
+            return await message.reply_text(f"Publish to {target}?", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Publish Now", callback_data="ui:publish")],
+                [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")]]))
+        if step == "date":
+            local = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+            due = local.astimezone(timezone.utc).replace(tzinfo=None)
+            if due <= datetime.now(timezone.utc).replace(tzinfo=None):
+                raise ValueError("Choose a future date/time.")
+            state["due"] = due
+            state["step"] = "confirm"
+            return await message.reply_text(f"Schedule for {local:%Y-%m-%d %H:%M} ({TZ})?", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm Schedule", callback_data="ui:save")],
+                [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")]]))
+    except (ValueError, RPCError) as exc:
+        await message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
+    except Exception:
+        log.exception("Menu input failed")
+        await message.reply_text("❌ Error. Check VPS logs.")
 
 
 async def dispatch_job(job):
