@@ -156,7 +156,7 @@ HELP = (
     "Visit website | https://example.com\n\n"
     "The button lines are optional for /schedule.\n"
     "Time zone: " + str(TZ) + "\n\n"
-    "/scheduled — show pending posts\n"
+    "/demo — preview a post with buttons privately\n"\n    "/scheduled — show pending posts\n"
     "/cancel 123 — cancel your scheduled post\n\n"
     "For private groups/channels use their -100... ID instead of @username.\n"
     "The bot and you must both be destination admins."
@@ -166,6 +166,39 @@ HELP = (
 @app.on_message(filters.private & filters.command(["start", "help"]))
 async def start(_, message):
     await message.reply_text(HELP, disable_web_page_preview=True)
+
+
+@app.on_message(filters.private & filters.command("demo"))
+async def demo(client, message):
+    """Preview the replied-to media/text post and its URL buttons in private chat."""
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        return await message.reply_text("Not authorized.")
+    if not message.reply_to_message:
+        return await message.reply_text(
+            "Reply to a text, photo, video or document with:\n"
+            "/demo\n"
+            "Website | https://example.com\n"
+            "Join Group | https://t.me/example"
+        )
+    try:
+        lines = (message.text or "").splitlines()
+        if len(lines[0].split()) != 1:
+            raise ValueError("Use /demo on the first line, then optional button lines.")
+        buttons = parse_buttons(lines[1:])
+        await client.copy_message(
+            message.chat.id, message.chat.id, message.reply_to_message.id,
+            reply_markup=keyboard(buttons),
+        )
+        await message.reply_text(
+            "👆 Demo preview only. Nothing has been published or scheduled.\n"
+            "To publish, reply to the original post using /buttons @yourchannel "
+            "with the same button lines."
+        )
+    except ValueError as exc:
+        await message.reply_text("❌ " + str(exc))
+    except RPCError:
+        log.exception("Could not render demo")
+        await message.reply_text("❌ Could not preview this message.")
 
 
 @app.on_message(filters.private & filters.command(["buttons", "schedule"]))
