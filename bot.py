@@ -1,20 +1,29 @@
-"""AGS Movie Link Bot. New channel posts only; independent of OTT database."""
+"""AGS Telegram Button Creator and Post Scheduler.
+
+Private-chat commands. The bot must be an administrator of each target channel/group.
+Times are interpreted in the configured TIMEZONE (default Asia/Kolkata).
+Existing movie database tables are not modified.
+"""
 import asyncio
-import html
+import json
 import logging
 import os
 import re
-from urllib.parse import unquote
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import aiomysql
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
+from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ags-movie-link")
+log = logging.getLogger("ags-post-scheduler")
+
 
 def required(key):
     value = os.getenv(key)
@@ -22,216 +31,312 @@ def required(key):
         raise RuntimeError("Missing configuration: " + key)
     return value
 
-SOURCE = int(os.getenv("SOURCE_CHANNEL_ID", "-1002518840015"))
-USERNAME = required("BOT_USERNAME").lstrip("@")
-app = Client("ags_movie_link", api_id=int(required("API_ID")),
-             api_hash=required("API_HASH"), bot_token=required("BOT_TOKEN"))
+
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))
+ADMIN_IDS = {
+    int(value.strip()) for value in os.getenv("ADMIN_IDS", "").split(",")
+    if value.strip()
+}
+app = Client(
+    "ags_movie_link",
+    api_id=int(required("API_ID")),
+    api_hash=required("API_HASH"),
+    bot_token=required("BOT_TOKEN"),
+)
 pool = None
 
-def normalize(text):
-    text = re.sub(r"\.(mkv|mp4|avi|mov|webm|m4v)$", "", text or "", flags=re.I)
-    return " ".join(re.sub(r"[^\w]+", " ", text.casefold()).split())[:255]
 
-def parse_media(message):
-    media = message.document or message.video
-    if not media:
-        return None
-    raw = (getattr(media, "file_name", None) or
-           (message.caption or "").split("\n")[0]).strip()
-    raw = re.sub(r"\.(mkv|mp4|avi|mov|webm|m4v)$", "", raw, flags=re.I)
-    raw = re.sub(r"[._]+", " ", raw)
-    raw = re.sub(r"^(?:\s*\[[^\]]{1,35}\]\s*[-–|:]?\s*)+", "", raw)
-    raw = re.sub(r"^(?:(?:MS|MoviesHub|AGS)\s*[-–|:]\s*)+", "", raw, flags=re.I)
-    raw = re.split(r"\b(?:S\d{1,2}E\d{1,3}|S\d{1,2}|480p|720p|1080p|2160p|4K|HEVC|x264|x265|WEB[- ]?DL|BluRay|HDRip|Malayalam|Hindi|Tamil|Telugu|English)\b",
-                   raw, maxsplit=1, flags=re.I)[0]
-    title = re.sub(r"\s+", " ", raw).strip(" -–|[]()")
-    if not title or not re.search(r"[A-Za-z0-9]", title):
-        return None
-    quality = re.search(r"\b(480p|720p|1080p|2160p|4k)\b", (getattr(media, "file_name", "") or "") + " " + (message.caption or ""), re.I)
-    return title[:255], quality.group(1).upper() if quality else "Unknown"
-
-async def sql(statement, params=(), fetch=None):
+async def query(statement, params=(), mode=None):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(statement, params)
-            if fetch == "all":
-                return await cur.fetchall()
-            if fetch == "one":
+            if mode == "one":
                 return await cur.fetchone()
+            if mode == "all":
+                return await cur.fetchall()
+            return cur.rowcount
+
 
 async def setup():
     global pool
     pool = await aiomysql.create_pool(
         host=os.getenv("MYSQL_HOST", "127.0.0.1"),
         port=int(os.getenv("MYSQL_PORT", "3306")),
-        user=required("MYSQL_USER"), password=required("MYSQL_PASSWORD"),
+        user=required("MYSQL_USER"),
+        password=required("MYSQL_PASSWORD"),
         db=os.getenv("MYSQL_DATABASE", "ags_movie_link"),
-        autocommit=True, charset="utf8mb4", minsize=1, maxsize=4)
-    await sql("""CREATE TABLE IF NOT EXISTS files (
+        autocommit=True, charset="utf8mb4", minsize=1, maxsize=4,
+    )
+    await query("""CREATE TABLE IF NOT EXISTS scheduled_posts (
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        source_channel BIGINT NOT NULL,
+        owner_id BIGINT NOT NULL,
+        source_chat BIGINT NOT NULL,
         source_message BIGINT NOT NULL,
-        title VARCHAR(255) NOT NULL,
-        normalized_title VARCHAR(255) NOT NULL,
-        quality VARCHAR(24) NOT NULL,
-        filename VARCHAR(1024) NOT NULL DEFAULT '',
-        indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY uq_message (source_channel,source_message),
-        INDEX idx_title (normalized_title(191))
+        target_chat VARCHAR(255) NOT NULL,
+        buttons_json TEXT NOT NULL,
+        scheduled_utc DATETIME NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        attempts INT NOT NULL DEFAULT 0,
+        last_error VARCHAR(512) NULL,
+        sent_message BIGINT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_due (status, scheduled_utc),
+        INDEX idx_owner (owner_id, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
-    # Add optional display metadata without dropping existing indexed files.
-    for name, definition in [("poster_file_id", "VARCHAR(512) NULL"),
-                             ("release_year", "VARCHAR(4) NULL"),
-                             ("language", "VARCHAR(100) NULL"),
-                             ("rating", "VARCHAR(16) NULL"),
-                             ("genres", "VARCHAR(255) NULL"),
-                             ("media_type", "VARCHAR(32) NOT NULL DEFAULT 'Movie'")]:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""SELECT COUNT(*) FROM information_schema.columns
-                    WHERE table_schema=DATABASE() AND table_name='files' AND column_name=%s""", (name,))
-                exists = (await cur.fetchone())[0]
-                if not exists:
-                    await cur.execute("ALTER TABLE files ADD COLUMN " + name + " " + definition)
+    # Recover work claimed before an unexpected process restart.
+    await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
 
-@app.on_message(filters.channel & filters.chat(SOURCE) & (filters.document | filters.video))
-async def on_new_media(_, message):
-    parsed = parse_media(message)
-    if not parsed:
-        log.warning("Unrecognized media title for message %s", message.id)
-        return
-    title, quality = parsed
-    media = message.document or message.video
-    raw = (getattr(media, "file_name", None) or "") + " " + (message.caption or "")
-    year = re.search(r"\\b(?:19|20)\\d{2}\\b", raw)
-    language = re.search(r"\\b(Malayalam|English|Hindi|Tamil|Telugu|Kannada)\\b", raw, re.I)
-    # Optional structured metadata in the file caption: Rating: 4.5, Genres: Drama, Type: TV Series.
-    caption = message.caption or ""
-    rating = re.search(r"(?im)^\\s*(?:⭐\\s*)?rating(?:s)?\\s*:\\s*([^\\n]{1,16})", caption)
-    genres = re.search(r"(?im)^\\s*genres?\\s*:\\s*([^\\n]{1,255})", caption)
-    kind = re.search(r"(?im)^\\s*type\\s*:\\s*(Movie|TV Series|Series)\\s*$", caption)
-    # Poster can be supplied as Telegram photo file ID via caption: PosterFileID: <id>.
-    poster = re.search(r"(?im)^\\s*PosterFileID\\s*:\\s*([A-Za-z0-9_-]{15,512})\\s*$", caption)
+
+def parse_target(value):
+    if re.fullmatch(r"-100\d{5,20}", value):
+        return int(value)
+    if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value):
+        return value
+    raise ValueError("Target must be a public @channel username or -100... chat ID.")
+
+
+def parse_buttons(lines):
+    buttons = []
+    for line in lines:
+        if not line.strip():
+            continue
+        if "|" not in line:
+            raise ValueError("Each button must be written as: Button name | https://example.com")
+        label, url = (part.strip() for part in line.split("|", 1))
+        parsed = urlparse(url)
+        if not label or len(label) > 64 or len(url) > 2048:
+            raise ValueError("Button name or URL has an invalid length.")
+        if parsed.scheme not in ("https", "http") or not parsed.netloc:
+            raise ValueError("Buttons require full http:// or https:// URLs.")
+        if parsed.username or parsed.password or any(c.isspace() for c in url):
+            raise ValueError("Invalid button URL.")
+        buttons.append([label, url])
+    if len(buttons) > 20:
+        raise ValueError("Maximum 20 buttons per post.")
+    return buttons
+
+
+def keyboard(buttons):
+    if not buttons:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, url=url)] for label, url in buttons
+    ])
+
+
+async def check_permission(client, message, target):
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        raise ValueError("You are not authorized to use this bot.")
     try:
-        await sql("""INSERT INTO files
-            (source_channel,source_message,title,normalized_title,quality,filename,poster_file_id,release_year,language,rating,genres,media_type)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON DUPLICATE KEY UPDATE title=VALUES(title),
-            normalized_title=VALUES(normalized_title), quality=VALUES(quality),
-            filename=VALUES(filename),poster_file_id=COALESCE(VALUES(poster_file_id),poster_file_id),
-            release_year=VALUES(release_year),language=VALUES(language),
-            rating=VALUES(rating),genres=VALUES(genres),media_type=VALUES(media_type)""",
-            (SOURCE, message.id, title, normalize(title), quality,
-             (getattr(media, "file_name", None) or "")[:1024],
-             poster.group(1) if poster else None,
-             year.group(0) if year else None, language.group(1).title() if language else None,
-             rating.group(1).strip() if rating else None,
-             genres.group(1).strip() if genres else None,
-             kind.group(1) if kind else "Movie"))
-        log.info("Indexed new file: %s / %s", message.id, title)
-    except Exception:
-        log.exception("Indexing failed for message %s", message.id)
+        me = await client.get_me()
+        bot_member = await client.get_chat_member(target, me.id)
+        user_member = await client.get_chat_member(target, message.from_user.id)
+    except RPCError as exc:
+        raise ValueError("Cannot verify channel/group permissions. Add the bot as admin and try again.") from exc
+    admin_states = (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+    if bot_member.status not in admin_states:
+        raise ValueError("The bot must be an admin in the destination.")
+    if user_member.status not in admin_states:
+        raise ValueError("You must be an admin in the destination.")
+    if target and bot_member.status == ChatMemberStatus.ADMINISTRATOR:
+        if not getattr(bot_member.privileges, "can_post_messages", True):
+            raise ValueError("The bot needs permission to post messages.")
+    return target
 
-async def search(message, term):
-    key = normalize(unquote(term).replace("_", " "))
-    if len(key) < 2:
-        return await message.reply_text("Send a movie title to search.")
-    tokens = key.split()
-    if not tokens:
-        return await message.reply_text("Send a movie title to search.")
-    pattern = "%" + "%".join(tokens) + "%"
-    rows = await sql("""SELECT id,title,quality,filename,poster_file_id,release_year,language,rating,genres,media_type FROM files
-        WHERE normalized_title LIKE %s ORDER BY id DESC LIMIT 12""",
-        (pattern,), fetch="all")
-    if not rows and re.fullmatch(r"(19|20)\d{2}", tokens[-1]) and len(tokens) > 1:
-        # Retry without year only when stored filenames omit it.
-        rows = await sql("""SELECT id,title,quality,filename FROM files
-            WHERE normalized_title LIKE %s ORDER BY id DESC LIMIT 12""",
-            ("%" + "%".join(tokens[:-1]) + "%",), fetch="all")
-    if not rows:
-        return await message.reply_text("No matching new files indexed yet.")
-    if len(rows) == 1:
-        return await show_movie(message, rows[0])
-    buttons = [[InlineKeyboardButton(
-        (r["filename"] or r["title"])[:42] + " · " + r["quality"],
-        callback_data="preview:" + str(r["id"]))] for r in rows]
-    await message.reply_text("🎬 Choose a version to view its details:", reply_markup=InlineKeyboardMarkup(buttons))
 
-async def show_movie(message, row):
-    def safe(value):
-        return html.escape(str(value or "Not available"))
-    caption = ("🎬 <b>" + safe(row["title"]) + "</b>\\n\\n"
-               "🎞 <b>Type:</b> " + safe(row["media_type"]) + "\\n"
-               "📅 <b>Year:</b> " + safe(row["release_year"]) + "\\n"
-               "⭐ <b>Rating:</b> " + safe(row["rating"]) + "\\n"
-               "🔊 <b>Language:</b> " + safe(row["language"]) + "\\n"
-               "🎭 <b>Genres:</b> " + safe(row["genres"]) + "\\n"
-               "📺 <b>Quality:</b> " + safe(row["quality"]) + "\\n\\n"
-               "📥 Tap DOWNLOAD to receive the file privately.")
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
-        "📥 DOWNLOAD", callback_data="file:" + str(row["id"]))]])
-    if row.get("poster_file_id"):
-        try:
-            return await message.reply_photo(row["poster_file_id"], caption=caption,
-                                             parse_mode="html", reply_markup=keyboard)
-        except RPCError:
-            log.warning("Poster unavailable for file %s; showing text", row["id"])
-    return await message.reply_text(caption, parse_mode="html", reply_markup=keyboard)
+HELP = (
+    "🛠 Button Creator & Post Scheduler\n\n"
+    "Reply to a text, photo, video, or document in this private chat.\n\n"
+    "📌 Publish with buttons:\n"
+    "/buttons @yourchannel\n"
+    "Visit website | https://example.com\n"
+    "Join group | https://t.me/example\n\n"
+    "🗓 Schedule a post:\n"
+    "/schedule @yourchannel 2026-11-21 18:30\n"
+    "Visit website | https://example.com\n\n"
+    "The button lines are optional for /schedule.\n"
+    "Time zone: " + str(TZ) + "\n\n"
+    "/scheduled — show pending posts\n"
+    "/cancel 123 — cancel your scheduled post\n\n"
+    "For private groups/channels use their -100... ID instead of @username.\n"
+    "The bot and you must both be destination admins."
+)
 
-@app.on_callback_query(filters.regex(r"^preview:\\d+$"))
-async def preview(_, callback):
-    await callback.answer()
-    row = await sql("""SELECT id,title,quality,poster_file_id,release_year,
-        language,rating,genres,media_type FROM files WHERE id=%s""",
-        (int(callback.data.split(":")[1]),), fetch="one")
-    if not row:
-        return await callback.message.reply_text("File not found.")
-    await show_movie(callback.message, row)
 
-async def send_file(user_id, file_id):
-    row = await sql("SELECT source_channel,source_message FROM files WHERE id=%s",
-                    (file_id,), fetch="one")
-    if not row:
-        return await app.send_message(user_id, "File not found.")
-    try:
-        await app.copy_message(user_id, row["source_channel"], row["source_message"])
-    except FloodWait as exc:
-        await asyncio.sleep(exc.value)
-        await app.copy_message(user_id, row["source_channel"], row["source_message"])
-    except RPCError:
-        log.exception("Cannot deliver indexed file %s", file_id)
-        await app.send_message(user_id, "File unavailable. Check source channel access.")
-
-@app.on_message(filters.private & filters.command("start"))
+@app.on_message(filters.private & filters.command(["start", "help"]))
 async def start(_, message):
-    payload = message.command[1] if len(message.command) > 1 else ""
-    if payload.startswith("search_"):
-        return await search(message, payload[7:])
-    await message.reply_text("🎬 Welcome! Send a movie title to find new uploads.")
+    await message.reply_text(HELP, disable_web_page_preview=True)
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start"]))
-async def text_search(_, message):
-    await search(message, message.text)
 
-@app.on_callback_query(filters.regex(r"^file:\d+$"))
-async def deliver(_, callback):
-    await callback.answer()
-    if callback.from_user:
-        await send_file(callback.from_user.id, int(callback.data.split(":")[1]))
+@app.on_message(filters.private & filters.command(["buttons", "schedule"]))
+async def create_post(client, message):
+    if not message.reply_to_message:
+        return await message.reply_text("Reply to the message you want to publish with this command.\n\n" + HELP)
+    try:
+        parts = (message.text or "").splitlines()
+        header = parts[0].split()
+        scheduled = message.command[0].lower() == "schedule"
+        expected = 4 if scheduled else 2
+        if len(header) != expected:
+            raise ValueError(
+                "Use /buttons @channel, or /schedule @channel YYYY-MM-DD HH:MM."
+            )
+        target = parse_target(header[1])
+        await check_permission(client, message, target)
+        buttons = parse_buttons(parts[1:])
+        if scheduled:
+            naive = datetime.strptime(header[2] + " " + header[3], "%Y-%m-%d %H:%M")
+            local = naive.replace(tzinfo=TZ)
+            due = local.astimezone(timezone.utc).replace(tzinfo=None)
+            if due <= datetime.now(timezone.utc).replace(tzinfo=None):
+                raise ValueError("Choose a future date and time.")
+            await query(
+                """INSERT INTO scheduled_posts
+                (owner_id,source_chat,source_message,target_chat,buttons_json,scheduled_utc)
+                VALUES (%s,%s,%s,%s,%s,%s)""",
+                (message.from_user.id, message.chat.id, message.reply_to_message.id,
+                 str(target), json.dumps(buttons), due),
+            )
+            row = await query(
+                """SELECT id FROM scheduled_posts WHERE owner_id=%s
+                ORDER BY id DESC LIMIT 1""", (message.from_user.id,), mode="one"
+            )
+            return await message.reply_text(
+                f"✅ Scheduled post #{row['id']} for {local:%Y-%m-%d %H:%M} ({TZ}).\n"
+                "Keep the original message in this chat until it is sent."
+            )
+        sent = await client.copy_message(
+            target, message.chat.id, message.reply_to_message.id,
+            reply_markup=keyboard(buttons),
+        )
+        await message.reply_text(f"✅ Post published! Message ID: {sent.id}")
+    except (ValueError, RPCError, FloodWait) as exc:
+        await message.reply_text("❌ " + str(exc))
+    except Exception:
+        log.exception("Failed to create post")
+        await message.reply_text("❌ Could not create the post. Check the VPS logs.")
+
+
+@app.on_message(filters.private & filters.command("scheduled"))
+async def scheduled_list(_, message):
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        return await message.reply_text("Not authorized.")
+    rows = await query(
+        """SELECT id,target_chat,scheduled_utc FROM scheduled_posts
+        WHERE owner_id=%s AND status='pending'
+        ORDER BY scheduled_utc LIMIT 20""",
+        (message.from_user.id,), mode="all",
+    )
+    if not rows:
+        return await message.reply_text("No pending posts.")
+    lines = ["🗓 Your next scheduled posts:"]
+    for row in rows:
+        utc = row["scheduled_utc"].replace(tzinfo=timezone.utc)
+        local = utc.astimezone(TZ)
+        lines.append(f"#{row['id']} · {row['target_chat']} · {local:%Y-%m-%d %H:%M}")
+    await message.reply_text("\n".join(lines) + "\n\n/cancel ID to cancel.")
+
+
+@app.on_message(filters.private & filters.command("cancel"))
+async def cancel(_, message):
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+        return await message.reply_text("Not authorized.")
+    try:
+        job_id = int(message.command[1])
+    except (IndexError, ValueError):
+        return await message.reply_text("Usage: /cancel 123")
+    changed = await query(
+        """UPDATE scheduled_posts SET status='cancelled'
+        WHERE id=%s AND owner_id=%s AND status='pending'""",
+        (job_id, message.from_user.id),
+    )
+    await message.reply_text("✅ Cancelled." if changed else "Post not found or already processing.")
+
+
+async def dispatch_job(job):
+    try:
+        buttons = json.loads(job["buttons_json"])
+        target = parse_target(job["target_chat"])
+        sent = await app.copy_message(
+            target, job["source_chat"], job["source_message"],
+            reply_markup=keyboard(buttons),
+        )
+        await query(
+            """UPDATE scheduled_posts SET status='sent',sent_message=%s,
+            last_error=NULL WHERE id=%s""",
+            (sent.id, job["id"]),
+        )
+        log.info("Scheduled post #%s sent", job["id"])
+    except FloodWait as exc:
+        await query(
+            """UPDATE scheduled_posts SET status='pending',
+            scheduled_utc=DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s SECOND),
+            attempts=attempts+1, last_error=%s WHERE id=%s""",
+            (max(int(exc.value), 1) + 2, "Telegram flood wait", job["id"]),
+        )
+    except Exception as exc:
+        log.exception("Scheduled post #%s failed", job["id"])
+        await query(
+            """UPDATE scheduled_posts SET status='failed',
+            attempts=attempts+1,last_error=%s WHERE id=%s""",
+            (str(exc)[:512], job["id"]),
+        )
+        try:
+            await app.send_message(
+                job["owner_id"],
+                f"❌ Scheduled post #{job['id']} failed. Check the destination and source message.",
+            )
+        except Exception:
+            log.exception("Could not notify owner")
+
+
+async def scheduler():
+    while True:
+        try:
+            jobs = await query(
+                """SELECT * FROM scheduled_posts
+                WHERE status='pending' AND scheduled_utc<=UTC_TIMESTAMP()
+                ORDER BY scheduled_utc,id LIMIT 20""",
+                mode="all",
+            )
+            for job in jobs:
+                claimed = await query(
+                    """UPDATE scheduled_posts SET status='sending'
+                    WHERE id=%s AND status='pending'""",
+                    (job["id"],),
+                )
+                if claimed:
+                    await dispatch_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scheduler iteration failed")
+        await asyncio.sleep(10)
+
 
 async def main():
     await setup()
-    await app.start()
-    me = await app.get_me()
-    if (me.username or "").casefold() != USERNAME.casefold():
-        raise RuntimeError("BOT_USERNAME does not match BOT_TOKEN")
-    log.info("AGS Movie Link Bot started: @%s, source=%s", me.username, SOURCE)
+    task = None
     try:
+        await app.start()
+        me = await app.get_me()
+        log.info("Button Creator & Post Scheduler started: @%s", me.username)
+        task = asyncio.create_task(scheduler())
         await idle()
     finally:
-        await app.stop()
-        pool.close()
-        await pool.wait_closed()
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if app.is_connected:
+            await app.stop()
+        if pool:
+            pool.close()
+            await pool.wait_closed()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Use Pyrogram's own event loop, avoiding cross-loop dispatcher shutdown errors.
+    app.run(main())
