@@ -1,5 +1,6 @@
 """AGS Movie Link Bot. New channel posts only; independent of OTT database."""
 import asyncio
+import html
 import logging
 import os
 import re
@@ -78,6 +79,20 @@ async def setup():
         UNIQUE KEY uq_message (source_channel,source_message),
         INDEX idx_title (normalized_title(191))
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+    # Add optional display metadata without dropping existing indexed files.
+    for name, definition in [("poster_file_id", "VARCHAR(512) NULL"),
+                             ("release_year", "VARCHAR(4) NULL"),
+                             ("language", "VARCHAR(100) NULL"),
+                             ("rating", "VARCHAR(16) NULL"),
+                             ("genres", "VARCHAR(255) NULL"),
+                             ("media_type", "VARCHAR(32) NOT NULL DEFAULT 'Movie'")]:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""SELECT COUNT(*) FROM information_schema.columns
+                    WHERE table_schema=DATABASE() AND table_name='files' AND column_name=%s""", (name,))
+                exists = (await cur.fetchone())[0]
+                if not exists:
+                    await cur.execute("ALTER TABLE files ADD COLUMN " + name + " " + definition)
 
 @app.on_message(filters.channel & filters.chat(SOURCE) & (filters.document | filters.video))
 async def on_new_media(_, message):
@@ -87,15 +102,32 @@ async def on_new_media(_, message):
         return
     title, quality = parsed
     media = message.document or message.video
+    raw = (getattr(media, "file_name", None) or "") + " " + (message.caption or "")
+    year = re.search(r"\\b(?:19|20)\\d{2}\\b", raw)
+    language = re.search(r"\\b(Malayalam|English|Hindi|Tamil|Telugu|Kannada)\\b", raw, re.I)
+    # Optional structured metadata in the file caption: Rating: 4.5, Genres: Drama, Type: TV Series.
+    caption = message.caption or ""
+    rating = re.search(r"(?im)^\\s*(?:⭐\\s*)?rating(?:s)?\\s*:\\s*([^\\n]{1,16})", caption)
+    genres = re.search(r"(?im)^\\s*genres?\\s*:\\s*([^\\n]{1,255})", caption)
+    kind = re.search(r"(?im)^\\s*type\\s*:\\s*(Movie|TV Series|Series)\\s*$", caption)
+    # Poster can be supplied as Telegram photo file ID via caption: PosterFileID: <id>.
+    poster = re.search(r"(?im)^\\s*PosterFileID\\s*:\\s*([A-Za-z0-9_-]{15,512})\\s*$", caption)
     try:
         await sql("""INSERT INTO files
-            (source_channel,source_message,title,normalized_title,quality,filename)
-            VALUES (%s,%s,%s,%s,%s,%s)
+            (source_channel,source_message,title,normalized_title,quality,filename,poster_file_id,release_year,language,rating,genres,media_type)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON DUPLICATE KEY UPDATE title=VALUES(title),
-            normalized_title=VALUES(normalized_title),
-            quality=VALUES(quality),filename=VALUES(filename)""",
+            normalized_title=VALUES(normalized_title), quality=VALUES(quality),
+            filename=VALUES(filename),poster_file_id=COALESCE(VALUES(poster_file_id),poster_file_id),
+            release_year=VALUES(release_year),language=VALUES(language),
+            rating=VALUES(rating),genres=VALUES(genres),media_type=VALUES(media_type)""",
             (SOURCE, message.id, title, normalize(title), quality,
-             (getattr(media, "file_name", None) or "")[:1024]))
+             (getattr(media, "file_name", None) or "")[:1024],
+             poster.group(1) if poster else None,
+             year.group(0) if year else None, language.group(1).title() if language else None,
+             rating.group(1).strip() if rating else None,
+             genres.group(1).strip() if genres else None,
+             kind.group(1) if kind else "Movie"))
         log.info("Indexed new file: %s / %s", message.id, title)
     except Exception:
         log.exception("Indexing failed for message %s", message.id)
@@ -108,7 +140,7 @@ async def search(message, term):
     if not tokens:
         return await message.reply_text("Send a movie title to search.")
     pattern = "%" + "%".join(tokens) + "%"
-    rows = await sql("""SELECT id,title,quality,filename FROM files
+    rows = await sql("""SELECT id,title,quality,filename,poster_file_id,release_year,language,rating,genres,media_type FROM files
         WHERE normalized_title LIKE %s ORDER BY id DESC LIMIT 12""",
         (pattern,), fetch="all")
     if not rows and re.fullmatch(r"(19|20)\d{2}", tokens[-1]) and len(tokens) > 1:
@@ -119,11 +151,42 @@ async def search(message, term):
     if not rows:
         return await message.reply_text("No matching new files indexed yet.")
     if len(rows) == 1:
-        return await send_file(message.chat.id, rows[0]["id"])
+        return await show_movie(message, rows[0])
     buttons = [[InlineKeyboardButton(
         (r["filename"] or r["title"])[:42] + " · " + r["quality"],
-        callback_data="file:" + str(r["id"]))] for r in rows]
-    await message.reply_text("Choose your file:", reply_markup=InlineKeyboardMarkup(buttons))
+        callback_data="preview:" + str(r["id"]))] for r in rows]
+    await message.reply_text("🎬 Choose a version to view its details:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_movie(message, row):
+    def safe(value):
+        return html.escape(str(value or "Not available"))
+    caption = ("🎬 <b>" + safe(row["title"]) + "</b>\\n\\n"
+               "🎞 <b>Type:</b> " + safe(row["media_type"]) + "\\n"
+               "📅 <b>Year:</b> " + safe(row["release_year"]) + "\\n"
+               "⭐ <b>Rating:</b> " + safe(row["rating"]) + "\\n"
+               "🔊 <b>Language:</b> " + safe(row["language"]) + "\\n"
+               "🎭 <b>Genres:</b> " + safe(row["genres"]) + "\\n"
+               "📺 <b>Quality:</b> " + safe(row["quality"]) + "\\n\\n"
+               "📥 Tap DOWNLOAD to receive the file privately.")
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📥 DOWNLOAD", callback_data="file:" + str(row["id"]))]])
+    if row.get("poster_file_id"):
+        try:
+            return await message.reply_photo(row["poster_file_id"], caption=caption,
+                                             parse_mode="html", reply_markup=keyboard)
+        except RPCError:
+            log.warning("Poster unavailable for file %s; showing text", row["id"])
+    return await message.reply_text(caption, parse_mode="html", reply_markup=keyboard)
+
+@app.on_callback_query(filters.regex(r"^preview:\\d+$"))
+async def preview(_, callback):
+    await callback.answer()
+    row = await sql("""SELECT id,title,quality,poster_file_id,release_year,
+        language,rating,genres,media_type FROM files WHERE id=%s""",
+        (int(callback.data.split(":")[1]),), fetch="one")
+    if not row:
+        return await callback.message.reply_text("File not found.")
+    await show_movie(callback.message, row)
 
 async def send_file(user_id, file_id):
     row = await sql("SELECT source_channel,source_message FROM files WHERE id=%s",
