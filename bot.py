@@ -398,7 +398,8 @@ async def target_selected(message, state, target):
         f"Publish to {target}?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🚀 Publish Now", callback_data="ui:publish")],
-            [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="ui:back"),
+             InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
         ]),
     )
 
@@ -522,6 +523,15 @@ async def menu_click(client, cb):
             "Missing a group/channel? Forward a channel post to this bot to connect it.",
             reply_markup=group_keyboard(groups),
         )
+    if action == "back" and state.get("step") == "confirm":
+        state.pop("due", None)
+        state.pop("target", None)
+        state["step"] = "target"
+        groups = await group_picker(client, user.id)
+        return await cb.message.edit_text(
+            "⬅️ Choose a different group or channel. Your post and URL buttons are saved.",
+            reply_markup=group_keyboard(groups),
+        )
     if state.get("step") != "confirm":
         return await cb.message.reply_text("Complete the earlier steps first.")
     try:
@@ -582,7 +592,8 @@ async def menu_input(client, message):
             state["step"] = "confirm"
             return await message.reply_text(f"Schedule for {local:%Y-%m-%d %H:%M} ({TZ})?", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Confirm Schedule", callback_data="ui:save")],
-                [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")]]))
+                [InlineKeyboardButton("⬅️ Back", callback_data="ui:back"),
+                 InlineKeyboardButton("🏠 Home", callback_data="ui:home")]]))
     except (ValueError, RPCError) as exc:
         await message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
     except Exception:
