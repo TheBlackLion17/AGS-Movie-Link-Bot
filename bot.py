@@ -476,38 +476,8 @@ async def group_picker(client, user_id):
     return available
 
 
-def group_keyboard(groups):
-    buttons = [
-        [InlineKeyboardButton(("📢 " if row["chat_type"] == "channel" else "👥 ") + row["title"][:45], callback_data=f"ui:group:{row['chat_id']}")]
-        for row in groups[:40]
-    ]
-    buttons.append([InlineKeyboardButton("🔄 Refresh Groups", callback_data="ui:refresh")])
-    buttons.append([InlineKeyboardButton("✍️ Enter ID Manually", callback_data="ui:manual")])
-    buttons.append([InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")])
-    return InlineKeyboardMarkup(buttons)
-
-
-async def target_selected(message, state, target):
-    state["target"] = target
-    if state["mode"] == "schedule":
-        state["step"] = "date"
-        return await message.reply_text(
-            f"🕒 Send date/time ({TZ}):\nYYYY-MM-DD HH:MM",
-            reply_markup=cancel_menu(),
-        )
-    state["step"] = "confirm"
-    return await message.reply_text(
-        f"Publish to {target}?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 Publish Now", callback_data="ui:publish")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="ui:back"),
-             InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
-        ]),
-    )
-
-
 def main_menu():
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🖼 Create Post", callback_data="ui:create")],
         [InlineKeyboardButton("🗓 Schedule Post", callback_data="ui:schedule")],
         [InlineKeyboardButton("👁 Preview Demo", callback_data="ui:demo")],
@@ -515,21 +485,113 @@ def main_menu():
         [InlineKeyboardButton("👥 Groups & Channels", callback_data="ui:groups")],
         [InlineKeyboardButton("➕ Connect Group / Channel", callback_data="ui:connect")],
         [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
-        [InlineKeyboardButton("👑 Owner Settings", callback_data="ui:owner")],
-    ])
+    ]
+    rows.append([InlineKeyboardButton("👑 Owner Settings", callback_data="ui:owner")])
+    return InlineKeyboardMarkup(rows)
+
+
+def navigation(*rows):
+    return InlineKeyboardMarkup(list(rows) + [[
+        InlineKeyboardButton("⬅️ Back", callback_data="ui:back"),
+        InlineKeyboardButton("🏠 Home", callback_data="ui:home"),
+    ]])
 
 
 def draft_menu():
-    return InlineKeyboardMarkup([
+    return navigation(
         [InlineKeyboardButton("➕ Add URL Button", callback_data="ui:add")],
         [InlineKeyboardButton("👁 Preview", callback_data="ui:preview"),
          InlineKeyboardButton("➡️ Continue", callback_data="ui:next")],
-        [InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")],
-    ])
+    )
 
 
 def cancel_menu():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Cancel", callback_data="ui:home")]])
+    return navigation()
+
+
+async def render(client, user_id, state, text, markup, source=None):
+    """Edit one persistent bot menu message; user content and previews remain separate."""
+    menu_id = state.get("menu_id") if state else None
+    if not menu_id and source:
+        menu_id = source.id
+    if menu_id:
+        try:
+            return await client.edit_message_text(user_id, menu_id, text, reply_markup=markup)
+        except RPCError as exc:
+            if "MESSAGE_NOT_MODIFIED" in str(exc).upper():
+                return
+            log.warning("Menu edit failed; creating replacement: %s", exc)
+    msg = await client.send_message(user_id, text, reply_markup=markup)
+    if state is not None:
+        state["menu_id"] = msg.id
+    return msg
+
+
+async def render_cb(client, cb, state, text, markup):
+    if state is not None:
+        state["menu_id"] = cb.message.id
+    return await render(client, cb.from_user.id, state, text, markup, cb.message)
+
+
+def destination_keyboard(groups, selected, page=0, choosing=False):
+    size = 6
+    pages = max(1, (len(groups) + size - 1) // size)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for group in groups[page * size:(page + 1) * size]:
+        marker = "✅" if str(group["chat_id"]) in selected else "⬜"
+        kind = "📢" if group["chat_type"] == "channel" else "👥"
+        rows.append([InlineKeyboardButton(
+            f"{marker if choosing else kind} {group['title'][:42]}",
+            callback_data=f"ui:dest:{group['chat_id']}" if choosing else f"ui:detail:{group['chat_id']}"
+        )])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton("◀️", callback_data=f"ui:page:{max(page-1,0)}"),
+            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="ui:noop"),
+            InlineKeyboardButton("▶️", callback_data=f"ui:page:{min(page+1,pages-1)}"),
+        ])
+    if choosing:
+        rows.append([
+            InlineKeyboardButton("☑️ Select All", callback_data="ui:all"),
+            InlineKeyboardButton("🧹 Clear", callback_data="ui:clear"),
+        ])
+        rows.append([InlineKeyboardButton(f"➡️ Continue ({len(selected)})", callback_data="ui:confirm")])
+    else:
+        rows.append([InlineKeyboardButton("➕ Connect Another", callback_data="ui:connect")])
+    return navigation(*rows)
+
+
+def confirmation_keyboard(mode):
+    return navigation([InlineKeyboardButton(
+        "🗓 Confirm Schedule" if mode == "schedule" else "🚀 Publish Now",
+        callback_data="ui:save" if mode == "schedule" else "ui:publish"
+    )])
+
+
+async def destination_screen(client, user_id, state):
+    groups = await group_picker(client, user_id)
+    state["groups"] = groups
+    page = state.get("page", 0)
+    choosing = state.get("step") == "target"
+    text = ("📢 Select one or more groups/channels.\nTap to toggle selection."
+            if choosing else "👥 Your connected groups and channels.")
+    if not groups:
+        text += "\n\nNo accessible destinations yet. Connect a group or channel first."
+    return await render(client, user_id, state, text,
+                        destination_keyboard(groups, state.get("targets", []), page, choosing))
+
+
+async def confirmation_screen(client, user_id, state):
+    names = {str(g["chat_id"]): g["title"] for g in state.get("groups", [])}
+    lines = [names.get(str(t), str(t)) for t in state["targets"]]
+    label = "🗓 Confirm Scheduled Post" if state["mode"] == "schedule" else "✅ Confirm Post"
+    text = label + "\n\nDestinations:\n" + "\n".join("• " + n for n in lines)
+    if state["mode"] == "schedule" and state.get("due"):
+        local = state["due"].replace(tzinfo=timezone.utc).astimezone(TZ)
+        text += f"\n\n🕒 {local:%Y-%m-%d %H:%M} ({TZ})"
+    text += f"\n\n🔗 URL buttons: {len(state['buttons'])}"
+    return await render(client, user_id, state, text, confirmation_keyboard(state["mode"]))
 
 
 @app.on_callback_query(filters.regex(r"^ui:"))
@@ -538,146 +600,208 @@ async def menu_click(client, cb):
     if not user or not cb.message or cb.message.chat.id != user.id:
         return await cb.answer("Open the bot in private chat.", show_alert=True)
     action = cb.data[3:]
+    if action == "noop":
+        return await cb.answer()
     if action == "verify":
-        if await subscribed(client, user.id):
-            await cb.answer("Membership verified!")
-            return await cb.message.reply_text("🎉 Access granted! Welcome to AGS Post Manager.", reply_markup=main_menu())
-        await cb.answer("Membership not verified. Please join the channel.", show_alert=True)
-        return
+        if not await subscribed(client, user.id):
+            return await cb.answer("Please join the required channel first.", show_alert=True)
+        await cb.answer("Membership verified!")
+        return await render_cb(client, cb, sessions.get(user.id), "🎉 Access granted! Welcome to AGS Post Manager.", main_menu())
     if not await subscribed(client, user.id):
         await cb.answer("Join the required channel first.", show_alert=True)
-        return await join_prompt(cb.message)
-    if action.startswith("force") or action == "owner":
+        return await render_cb(client, cb, sessions.get(user.id),
+                               "🔒 Join our official channel to unlock the bot.", await join_markup())
+    await cb.answer()
+    state = sessions.get(user.id)
+    if state and state.get("menu_id") and cb.message.id != state["menu_id"]:
+        return await cb.answer("Use the latest menu.", show_alert=True)
+    if action == "home":
+        sessions.pop(user.id, None)
+        return await render_cb(client, cb, None, "🏠 AGS Post Manager — choose an action:", main_menu())
+    if action == "owner" or action.startswith("force"):
         if user.id not in ADMIN_IDS:
             return await cb.answer("Owner only.", show_alert=True)
-        await cb.answer()
         if action == "owner":
-            return await cb.message.reply_text("👑 Owner Settings", reply_markup=owner_menu())
+            return await render_cb(client, cb, state, "👑 Owner Settings", owner_menu())
         if action == "force":
-            return await force_screen(cb.message)
+            cfg = await force_config()
+            enabled = cfg.get("force_enabled") == "1"
+            return await render_cb(client, cb, state,
+                f"🔒 Force Subscribe: {'Enabled' if enabled else 'Disabled'}\nChannel: {cfg.get('force_chat') or 'Not configured'}",
+                force_menu(enabled))
         if action == "force_update":
-            sessions[user.id] = {"step": "force_channel"}
-            return await cb.message.reply_text("✏️ Send a public channel @username, https://t.me/username, or -100... channel ID.\nThe bot must already be a channel admin.", reply_markup=cancel_menu())
+            sessions[user.id] = {"step": "force_channel", "menu_id": cb.message.id}
+            return await render_cb(client, cb, sessions[user.id],
+                "✏️ Send a public channel @username, https://t.me/username, or -100... ID.\nThe bot must be a channel admin.", cancel_menu())
         if action == "force_toggle":
             cfg = await force_config()
             if cfg.get("force_enabled") != "1" and not cfg.get("force_chat"):
-                return await cb.message.reply_text("❌ Configure a required channel first.", reply_markup=owner_menu())
-            await set_config("force_enabled", "0" if cfg.get("force_enabled") == "1" else "1")
-            return await force_screen(cb.message)
-    await cb.answer()
-    state = sessions.get(user.id)
-    if action == "home":
-        sessions.pop(user.id, None)
-        return await cb.message.reply_text("🏠 Main menu", reply_markup=main_menu())
-    if action in ("groups", "refresh"):
-        groups = await group_picker(client, user.id)
-        intro = ("👥 Select a group or channel to post to:" if state and state.get("step") == "target"
-                 else "👥 Registered groups and channels where you and the bot are admins:")
-        if not groups:
-            intro += "\nNo destinations found. Add the bot as admin or register an existing group/channel."
-        return await cb.message.reply_text(intro, reply_markup=group_keyboard(groups))
-    if action == "connect":
-        me = await client.get_me()
-        link = "https://t.me/" + me.username + "?startgroup=connect"
-        channel_link = "https://t.me/" + me.username + "?startchannel=connect&admin=post_messages"
-        return await cb.message.reply_text(
-            "➕ Connect a Telegram group\\n\\n"
-            "Tap Select Group below and choose your group. "
-            "Telegram will ask you to add the bot. Give the bot admin rights "
-            "so it can publish scheduled posts.\\n\\n"
-            "After adding it, tap Refresh Groups.\\n\\n"
-            "If the bot is already in your group, send /register inside "
-            "that group once; Telegram does not send a new join event "
-            "when a bot is already a member.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👥 Select Group in Telegram", url=link)],
-                [InlineKeyboardButton("📢 Select Channel in Telegram", url=channel_link)],
-                [InlineKeyboardButton("🔄 Refresh Groups", callback_data="ui:refresh")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="ui:home")],
-            ]),
-        )
+                return await render_cb(client, cb, state, "❌ Configure a channel first.", owner_menu())
+            enabled = cfg.get("force_enabled") != "1"
+            await set_config("force_enabled", "1" if enabled else "0")
+            return await render_cb(client, cb, state,
+                f"🔒 Force Subscribe: {'Enabled' if enabled else 'Disabled'}",
+                force_menu(enabled))
     if action == "help":
-        return await cb.message.reply_text(HELP, reply_markup=main_menu())
+        return await render_cb(client, cb, state, HELP, navigation())
     if action == "list":
-        rows = await query(
-            "SELECT id,target_chat,scheduled_utc FROM scheduled_posts WHERE owner_id=%s AND status='pending' ORDER BY scheduled_utc LIMIT 20",
-            (user.id,), mode="all")
+        rows = await query("SELECT id,target_chat,scheduled_utc FROM scheduled_posts WHERE owner_id=%s AND status='pending' ORDER BY scheduled_utc LIMIT 20", (user.id,), mode="all")
         lines = ["📋 Pending posts:"]
         for row in rows:
             local = row["scheduled_utc"].replace(tzinfo=timezone.utc).astimezone(TZ)
             lines.append(f"#{row['id']} · {row['target_chat']} · {local:%Y-%m-%d %H:%M}")
         if not rows:
             lines.append("None")
-        return await cb.message.reply_text("\n".join(lines) + "\nUse /cancel ID to cancel.", reply_markup=main_menu())
+        return await render_cb(client, cb, state, "\n".join(lines), navigation())
+    if action == "connect":
+        me = await client.get_me()
+        return await render_cb(client, cb, state,
+            "➕ Connect Group / Channel\n\nChoose Telegram selection or Manual Register.\nThe bot and you must be destination admins.",
+            navigation(
+                [InlineKeyboardButton("👥 Select Group", url=f"https://t.me/{me.username}?startgroup=connect")],
+                [InlineKeyboardButton("📢 Select Channel", url=f"https://t.me/{me.username}?startchannel=connect&admin=post_messages")],
+                [InlineKeyboardButton("✍️ Manual Register", callback_data="ui:register")],
+                [InlineKeyboardButton("🔄 Connected Destinations", callback_data="ui:groups")],
+            ))
+    if action == "register":
+        state = {"step": "register", "menu_id": cb.message.id}
+        sessions[user.id] = state
+        return await render_cb(client, cb, state,
+            "✍️ Manual Register\n\nSend a -100... group/channel ID, @publicusername, or https://t.me/publicusername.\nBoth you and the bot must be admins.",
+            navigation())
     if action in ("create", "schedule", "demo"):
-        sessions[user.id] = {"mode": action, "step": "media", "buttons": []}
-        return await cb.message.reply_text("📸 Send a photo, video, document or text with its caption.", reply_markup=cancel_menu())
-    if action.startswith("group:"):
-        if not state or state.get("step") != "target":
-            return await cb.message.reply_text("Start a post first, then select a group.", reply_markup=main_menu())
-        try:
-            target = int(action.split(":", 1)[1])
-            registered = await query("SELECT chat_id FROM registered_groups WHERE chat_id=%s AND active=1", (target,), mode="one")
-            if not registered:
-                raise ValueError("Group is no longer registered.")
-            await check_permission(client, cb.message, target, actor_id=user.id)
-            return await target_selected(cb.message, state, target)
-        except (ValueError, RPCError) as exc:
-            return await cb.message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
-    if action == "manual":
-        if not state or state.get("step") != "target":
-            return await cb.message.reply_text("Start a post first.", reply_markup=main_menu())
-        return await cb.message.reply_text("Send @group or -100... group ID.", reply_markup=cancel_menu())
+        state = {"mode": action, "step": "media", "buttons": [], "targets": [], "menu_id": cb.message.id}
+        sessions[user.id] = state
+        return await render_cb(client, cb, state,
+            "🖼 Step 1 — Send a photo, video, document or text with its caption.",
+            navigation())
+    if action == "groups" or action == "refresh":
+        state = {"step": "browse", "page": 0, "menu_id": cb.message.id}
+        sessions[user.id] = state
+        return await destination_screen(client, user.id, state)
+    if action == "detail":
+        return
+    if action.startswith("detail:"):
+        target = int(action.split(":", 1)[1])
+        row = await query("SELECT title,chat_type FROM registered_groups WHERE chat_id=%s", (target,), mode="one")
+        return await render_cb(client, cb, state,
+            f"👥 {row['title'] if row else 'Destination not found'}\nID: {target}\n\nUse Create Post to publish.",
+            navigation([InlineKeyboardButton("👥 Destinations", callback_data="ui:groups")]))
+    if action.startswith("page:"):
+        if not state or state.get("step") not in ("target", "browse"):
+            return
+        state["page"] = int(action.split(":", 1)[1])
+        return await destination_screen(client, user.id, state)
+    if action == "back":
+        if not state:
+            return await render_cb(client, cb, None, "🏠 Main menu", main_menu())
+        step = state.get("step")
+        if step in ("register", "browse"):
+            return await menu_click_page(client, cb, "connect")
+        if step == "force_channel":
+            return await render_cb(client, cb, state, "👑 Owner Settings", owner_menu())
+        if step in ("media",):
+            sessions.pop(user.id, None)
+            return await render_cb(client, cb, None, "🏠 Main menu", main_menu())
+        if step in ("button", "ready"):
+            state["step"] = "ready" if "source" in state else "media"
+            return await render_cb(client, cb, state,
+                "🔗 Add URL buttons or continue." if "source" in state else "🖼 Send your post.",
+                draft_menu() if "source" in state else navigation())
+        if step == "target":
+            state["step"] = "ready"
+            return await render_cb(client, cb, state, "🔗 Add URL buttons or continue.", draft_menu())
+        if step == "confirm":
+            state["step"] = "target"
+            return await destination_screen(client, user.id, state)
+        if step == "date":
+            state["step"] = "target"
+            return await destination_screen(client, user.id, state)
     if not state or "source" not in state:
-        return await cb.message.reply_text("Start from the main menu.", reply_markup=main_menu())
+        return await render_cb(client, cb, state, "🏠 Start from the main menu.", main_menu())
     if action == "add":
         state["step"] = "button"
-        return await cb.message.reply_text("🔗 Send a button:\nDOWNLOAD | https://example.com", reply_markup=cancel_menu())
-    if action in ("preview", "next") and (action == "preview" or state["mode"] == "demo"):
+        return await render_cb(client, cb, state, "🔗 Send a button:\nDOWNLOAD | https://example.com", navigation())
+    if action == "preview":
         try:
             await client.copy_message(user.id, user.id, state["source"], reply_markup=keyboard(state["buttons"]))
         except RPCError:
-            return await cb.message.reply_text("❌ Preview failed. Is the original post still available?")
-        if action == "next":
-            sessions.pop(user.id, None)
-            return await cb.message.reply_text("✅ Demo complete. Nothing published.", reply_markup=main_menu())
-        return await cb.message.reply_text("👆 Preview above.", reply_markup=draft_menu())
+            return await render_cb(client, cb, state, "❌ Preview failed. Original post may be unavailable.", draft_menu())
+        return await render_cb(client, cb, state, "👁 Preview sent above. Continue when ready.", draft_menu())
     if action == "next":
-        state["step"] = "target"
-        groups = await group_picker(client, user.id)
-        return await cb.message.reply_text(
-            "📢 Select a registered group, or enter a destination manually.\n"
-            "Missing a group/channel? Forward a channel post to this bot to connect it.",
-            reply_markup=group_keyboard(groups),
-        )
-    if action == "back" and state.get("step") == "confirm":
-        state.pop("due", None)
-        state.pop("target", None)
-        state["step"] = "target"
-        groups = await group_picker(client, user.id)
-        return await cb.message.edit_text(
-            "⬅️ Choose a different group or channel. Your post and URL buttons are saved.",
-            reply_markup=group_keyboard(groups),
-        )
-    if state.get("step") != "confirm":
-        return await cb.message.reply_text("Complete the earlier steps first.")
-    try:
-        await check_permission(client, cb.message, state["target"], actor_id=user.id)
-        if action == "publish" and state["mode"] == "create":
-            sent = await client.copy_message(state["target"], user.id, state["source"], reply_markup=keyboard(state["buttons"]))
+        if state["mode"] == "demo":
+            try:
+                await client.copy_message(user.id, user.id, state["source"], reply_markup=keyboard(state["buttons"]))
+            except RPCError:
+                return await render_cb(client, cb, state, "❌ Demo failed.", draft_menu())
             sessions.pop(user.id, None)
-            return await cb.message.reply_text(f"✅ Published! Message ID: {sent.id}", reply_markup=main_menu())
-        if action == "save" and state["mode"] == "schedule":
-            await query(
-                "INSERT INTO scheduled_posts (owner_id,source_chat,source_message,target_chat,buttons_json,scheduled_utc) VALUES (%s,%s,%s,%s,%s,%s)",
-                (user.id, user.id, state["source"], str(state["target"]), json.dumps(state["buttons"]), state["due"]))
-            sessions.pop(user.id, None)
-            return await cb.message.reply_text("✅ Post scheduled.", reply_markup=main_menu())
-    except (ValueError, RPCError, FloodWait) as exc:
-        return await cb.message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
-    except Exception:
-        log.exception("Menu action failed")
-        return await cb.message.reply_text("❌ Action failed. Check VPS logs.")
+            return await render_cb(client, cb, None, "✅ Demo complete. Nothing published.", main_menu())
+        state["step"] = "target"
+        state["page"] = 0
+        return await destination_screen(client, user.id, state)
+    if action == "all" or action == "clear":
+        if state.get("step") != "target":
+            return
+        groups = await group_picker(client, user.id)
+        state["targets"] = [str(g["chat_id"]) for g in groups] if action == "all" else []
+        return await destination_screen(client, user.id, state)
+    if action.startswith("dest:"):
+        if state.get("step") != "target":
+            return
+        target = action.split(":", 1)[1]
+        available = {str(g["chat_id"]) for g in await group_picker(client, user.id)}
+        if target not in available:
+            return await render_cb(client, cb, state, "❌ Destination unavailable.", navigation())
+        selected = state.setdefault("targets", [])
+        if target in selected:
+            selected.remove(target)
+        else:
+            selected.append(target)
+        return await destination_screen(client, user.id, state)
+    if action == "confirm":
+        if state.get("step") != "target" or not state.get("targets"):
+            return await cb.answer("Select at least one destination.", show_alert=True)
+        if state["mode"] == "schedule":
+            state["step"] = "date"
+            return await render_cb(client, cb, state, f"🕒 Send a future date/time ({TZ}):\nYYYY-MM-DD HH:MM", navigation())
+        state["step"] = "confirm"
+        return await confirmation_screen(client, user.id, state)
+    if action in ("publish", "save") and state.get("step") == "confirm":
+        if (action == "publish" and state["mode"] != "create") or (action == "save" and state["mode"] != "schedule"):
+            return
+        state["step"] = "sending"
+        await render_cb(client, cb, state, "⏳ Processing selected destinations...", InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Please wait", callback_data="ui:noop")]]))
+        ok, errors = [], []
+        for target in state["targets"]:
+            try:
+                await check_permission(client, cb.message, int(target), actor_id=user.id)
+                if action == "publish":
+                    await client.copy_message(int(target), user.id, state["source"], reply_markup=keyboard(state["buttons"]))
+                else:
+                    await query("INSERT INTO scheduled_posts (owner_id,source_chat,source_message,target_chat,buttons_json,scheduled_utc) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (user.id, user.id, state["source"], target, json.dumps(state["buttons"]), state["due"]))
+                ok.append(target)
+            except (RPCError, ValueError, FloodWait) as exc:
+                errors.append(f"{target}: {str(exc)[:90]}")
+        sessions.pop(user.id, None)
+        result = f"✅ {'Scheduled' if action == 'save' else 'Published'}: {len(ok)}\n❌ Failed: {len(errors)}"
+        if errors:
+            result += "\n\n" + "\n".join(errors[:8])
+        return await render_cb(client, cb, None, result, main_menu())
+
+
+async def menu_click_page(client, cb, page):
+    if page == "connect":
+        me = await client.get_me()
+        sessions.pop(cb.from_user.id, None)
+        return await render_cb(client, cb, None,
+            "➕ Connect Group / Channel",
+            navigation(
+                [InlineKeyboardButton("👥 Select Group", url=f"https://t.me/{me.username}?startgroup=connect")],
+                [InlineKeyboardButton("📢 Select Channel", url=f"https://t.me/{me.username}?startchannel=connect&admin=post_messages")],
+                [InlineKeyboardButton("✍️ Manual Register", callback_data="ui:register")],
+                [InlineKeyboardButton("🔄 Connected Destinations", callback_data="ui:groups")],
+            ))
 
 
 @app.on_message(filters.private & ~filters.command(["start", "help", "demo", "buttons", "schedule", "scheduled", "cancel"]), group=1)
@@ -687,29 +811,48 @@ async def menu_input(client, message):
     state = sessions.get(message.from_user.id)
     if not state:
         return
-    if state.get("step") == "force_channel":
-        if message.from_user.id not in ADMIN_IDS:
+    uid = message.from_user.id
+    step = state.get("step")
+    if step == "force_channel":
+        if uid not in ADMIN_IDS:
             return
         if not message.text:
-            return await message.reply_text("Send a channel username, link or ID.")
+            return await render(client, uid, state, "Send a channel username, link or ID.", navigation())
         try:
             title = await save_force_channel(client, message.text)
-            sessions.pop(message.from_user.id, None)
-            await message.reply_text(f"✅ Required channel updated: {title}")
-            return await force_screen(message)
+            sessions.pop(uid, None)
+            return await render(client, uid, state, f"✅ Required channel updated: {title}", owner_menu())
         except (ValueError, RPCError) as exc:
-            return await message.reply_text("❌ " + str(exc))
-    if not await subscribed(client, message.from_user.id):
+            return await render(client, uid, state, "❌ " + str(exc), navigation())
+    if not await subscribed(client, uid):
         return await join_prompt(message)
-    step = state["step"]
+    if step == "register":
+        if not message.text:
+            return await render(client, uid, state, "Send a group/channel ID or public link.", navigation())
+        try:
+            value = message.text.strip()
+            if value.startswith("https://t.me/"):
+                slug = value[len("https://t.me/"):].split("?")[0].strip("/")
+                if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", slug):
+                    raise ValueError("Private invite links are not supported. Send the -100... ID.")
+                value = "@" + slug
+            target = parse_target(value)
+            await check_permission(client, message, target)
+            chat = await client.get_chat(target)
+            await save_group(chat)
+            sessions.pop(uid, None)
+            return await render(client, uid, state,
+                f"✅ Registered: {chat.title}\nID: {chat.id}", main_menu())
+        except (ValueError, RPCError) as exc:
+            return await render(client, uid, state, "❌ " + str(exc) + "\n\nTry another ID or public link.", navigation())
     if step == "media":
         if not (message.text or message.photo or message.video or message.document):
-            return await message.reply_text("Send a text, photo, video or document.")
+            return await render(client, uid, state, "🖼 Send a text, photo, video or document.", navigation())
         state["source"] = message.id
         state["step"] = "ready"
-        return await message.reply_text("✅ Post received. Add buttons or continue.", reply_markup=draft_menu())
+        return await render(client, uid, state, "✅ Post received.\nAdd URL buttons or continue.", draft_menu())
     if not message.text:
-        return await message.reply_text("Send text for this step.")
+        return await render(client, uid, state, "Send text for this step.", navigation())
     try:
         if step == "button":
             new = parse_buttons([message.text])
@@ -717,11 +860,8 @@ async def menu_input(client, message):
                 raise ValueError("Maximum 20 buttons.")
             state["buttons"].extend(new)
             state["step"] = "ready"
-            return await message.reply_text(f"✅ Button added ({len(state['buttons'])}/20).", reply_markup=draft_menu())
-        if step == "target":
-            target = parse_target(message.text.strip())
-            await check_permission(client, message, target)
-            return await target_selected(message, state, target)
+            return await render(client, uid, state,
+                f"✅ Button added ({len(state['buttons'])}/20).\nAdd another or continue.", draft_menu())
         if step == "date":
             local = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
             due = local.astimezone(timezone.utc).replace(tzinfo=None)
@@ -729,15 +869,12 @@ async def menu_input(client, message):
                 raise ValueError("Choose a future date/time.")
             state["due"] = due
             state["step"] = "confirm"
-            return await message.reply_text(f"Schedule for {local:%Y-%m-%d %H:%M} ({TZ})?", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Confirm Schedule", callback_data="ui:save")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="ui:back"),
-                 InlineKeyboardButton("🏠 Home", callback_data="ui:home")]]))
+            return await confirmation_screen(client, uid, state)
     except (ValueError, RPCError) as exc:
-        await message.reply_text("❌ " + str(exc), reply_markup=cancel_menu())
+        return await render(client, uid, state, "❌ " + str(exc), navigation())
     except Exception:
         log.exception("Menu input failed")
-        await message.reply_text("❌ Error. Check VPS logs.")
+        return await render(client, uid, state, "❌ Error. Check VPS logs.", navigation())
 
 
 async def dispatch_job(job):
