@@ -184,7 +184,7 @@ async def join_markup():
     cfg = await force_config()
     rows = []
     if cfg.get("force_link"):
-        rows.append([InlineKeyboardButton("📢 Join Required Channel", url=cfg["force_link"])])
+        rows.append([InlineKeyboardButton("🔗 Join Required Group / Channel", url=cfg["force_link"])])
     rows.append([InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="ui:verify")])
     return InlineKeyboardMarkup(rows)
 
@@ -196,7 +196,7 @@ async def join_prompt(message):
         "🗓 Schedule posts\n"
         "🔗 Add URL buttons\n"
         "👥 Connect your groups and channels\n\n"
-        "🔒 To unlock the bot, join our official channel and tap Check Again.",
+        "🔒 To unlock the bot, join our required group or channel and tap Check Again.",
         reply_markup=await join_markup(),
     )
 
@@ -223,7 +223,7 @@ async def force_screen(message):
     await message.reply_text(
         f"🔒 Force Subscribe: {'Enabled' if enabled else 'Disabled'}\n"
         f"Required channel: {cfg.get('force_chat') or 'Not configured'}\n\n"
-        "The bot must be an admin of the required channel to check membership.",
+        "The bot must be an admin of the required group/channel to check membership.",
         reply_markup=force_menu(enabled),
     )
 
@@ -238,15 +238,15 @@ async def save_force_channel(client, raw):
     else:
         target = parse_target(value)
     chat = await client.get_chat(target)
-    if chat.type.value != "channel":
-        raise ValueError("The required destination must be a Telegram channel.")
+    if chat.type.value not in ("channel", "group", "supergroup"):
+        raise ValueError("Choose a Telegram group, supergroup, or channel.")
     me = await client.get_me()
     bot_member = await client.get_chat_member(chat.id, me.id)
     if bot_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-        raise ValueError("Add the bot as an administrator of that channel first.")
-    link = ("https://t.me/" + chat.username) if chat.username else None
-    if not link:
-        raise ValueError("For private channels, configure a public username first (a join URL is required).")
+        raise ValueError("Add the bot as an administrator of that group/channel first.")
+    link = ("https://t.me/" + chat.username) if chat.username else getattr(chat, "invite_link", None)
+    if not link or not link.startswith("https://t.me/"):
+        raise ValueError("No join link available. Give the group/channel a public username or configure an invite link accessible to the bot.")
     await set_config("force_chat", chat.id)
     await set_config("force_link", link)
     return chat.title or link
@@ -610,7 +610,7 @@ async def menu_click(client, cb):
     if not await subscribed(client, user.id):
         await cb.answer("Join the required channel first.", show_alert=True)
         return await render_cb(client, cb, sessions.get(user.id),
-                               "🔒 Join our official channel to unlock the bot.", await join_markup())
+                               "🔒 Join our required group or channel to unlock the bot.", await join_markup())
     state = sessions.get(user.id)
     if state and state.get("menu_id") and cb.message.id != state["menu_id"]:
         return await cb.answer("Use the latest menu. Send /start to reset.", show_alert=True)
@@ -635,7 +635,7 @@ async def menu_click(client, cb):
         if action == "force_update":
             sessions[user.id] = {"step": "force_channel", "menu_id": cb.message.id}
             return await render_cb(client, cb, sessions[user.id],
-                "✏️ Send a public channel @username, https://t.me/username, or -100... ID.\nThe bot must be a channel admin.", cancel_menu())
+                "✏️ Send a group or channel @username, https://t.me/username, or -100... ID.\nThe bot must be a group/channel admin.", cancel_menu())
         if action == "force_toggle":
             cfg = await force_config()
             if cfg.get("force_enabled") != "1" and not cfg.get("force_chat"):
