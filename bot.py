@@ -174,6 +174,33 @@ async def set_config(key, value):
     await query("INSERT INTO bot_settings (setting_key,setting_value) VALUES (%s,%s) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)", (key, str(value)))
 
 
+async def welcome_config():
+    rows = await query("SELECT setting_key,setting_value FROM bot_settings WHERE setting_key IN ('welcome_text','welcome_photo')", mode="all")
+    return {row["setting_key"]: row["setting_value"] for row in rows}
+
+
+async def send_welcome(client, chat_id):
+    cfg = await welcome_config()
+    text = cfg.get("welcome_text") or "🛠 AGS Post Manager — choose an action:"
+    photo = cfg.get("welcome_photo")
+    if photo:
+        try:
+            await client.send_photo(chat_id, photo, caption=text[:1024], reply_markup=main_menu())
+            return
+        except RPCError:
+            log.exception("Welcome photo failed; falling back to text")
+    await client.send_message(chat_id, text[:4096], reply_markup=main_menu())
+
+
+def welcome_menu():
+    return navigation(
+        [InlineKeyboardButton("✏️ Edit Text", callback_data="ui:welcome_text"),
+         InlineKeyboardButton("🖼 Set Photo", callback_data="ui:welcome_photo")],
+        [InlineKeyboardButton("👁 Preview", callback_data="ui:welcome_preview"),
+         InlineKeyboardButton("🗑 Reset", callback_data="ui:welcome_reset")],
+    )
+
+
 async def required_destinations():
     return await query("SELECT chat_id,title,chat_type,join_link FROM force_destinations ORDER BY created_at,chat_id", mode="all")
 
@@ -224,6 +251,7 @@ async def join_prompt(message):
 def owner_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔒 Force Subscribe Settings", callback_data="ui:force")],
+        [InlineKeyboardButton("🖼 Welcome Message", callback_data="ui:welcome")],
         [InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
     ])
 
@@ -324,7 +352,7 @@ async def start(_, message):
     sessions.pop(user.id, None)
     if not await subscribed(_, user.id):
         return await join_prompt(message)
-    await message.reply_text("🛠 AGS Post Manager — choose an action:", reply_markup=main_menu())
+    await send_welcome(_, message.chat.id)
 
 
 @app.on_message(filters.private & filters.command("demo"))
@@ -679,7 +707,7 @@ async def menu_click(client, cb):
     if action == "home":
         sessions.pop(user.id, None)
         return await render_cb(client, cb, None, "🏠 AGS Post Manager — choose an action:", main_menu())
-    if action == "owner" or action.startswith("force"):
+    if action == "owner" or action.startswith("force") or action.startswith("welcome"):
         if user.id not in ADMIN_IDS:
             return await render_cb(client, cb, state,
                 "🔐 Owner Settings are restricted.\n\nYour Telegram user ID: " + str(user.id) +
@@ -687,6 +715,25 @@ async def menu_click(client, cb):
                 navigation())
         if action == "owner":
             return await render_cb(client, cb, state, "👑 Owner Settings", owner_menu())
+        if action == "welcome":
+            cfg = await welcome_config()
+            return await render_cb(client, cb, state,
+                "🖼 Welcome Message Settings\n\nText: " + ("Configured" if cfg.get("welcome_text") else "Default") +
+                "\nPhoto: " + ("Configured" if cfg.get("welcome_photo") else "None") +
+                "\n\nShown when a user sends /start.", welcome_menu())
+        if action in ("welcome_text", "welcome_photo"):
+            state = {"step": action, "menu_id": cb.message.id}
+            sessions[user.id] = state
+            prompt = ("✏️ Send the welcome text (maximum 1024 characters for photo captions)." if action == "welcome_text"
+                      else "🖼 Send the photo you want to use for the welcome message.")
+            return await render_cb(client, cb, state, prompt, navigation())
+        if action == "welcome_preview":
+            await send_welcome(client, user.id)
+            return await render_cb(client, cb, state, "👁 Welcome preview sent above.", welcome_menu())
+        if action == "welcome_reset":
+            await query("DELETE FROM bot_settings WHERE setting_key IN ('welcome_text','welcome_photo')")
+            sessions.pop(user.id, None)
+            return await render_cb(client, cb, None, "✅ Default welcome restored.", welcome_menu())
         if action == "force":
             cfg = await force_config()
             enabled = cfg.get("force_enabled") == "1"
@@ -803,8 +850,9 @@ async def menu_click(client, cb):
         step = state.get("step")
         if step in ("register", "browse"):
             return await menu_click_page(client, cb, "connect")
-        if step == "force_channel":
-            return await render_cb(client, cb, state, "👑 Owner Settings", owner_menu())
+        if step in ("force_channel", "welcome_text", "welcome_photo"):
+            sessions.pop(user.id, None)
+            return await render_cb(client, cb, None, "👑 Owner Settings", owner_menu())
         if step in ("media",):
             sessions.pop(user.id, None)
             return await render_cb(client, cb, None, "🏠 Main menu", main_menu())
@@ -918,6 +966,20 @@ async def menu_input(client, message):
         return
     uid = message.from_user.id
     step = state.get("step")
+    if step in ("welcome_text", "welcome_photo"):
+        if uid not in ADMIN_IDS:
+            return
+        if step == "welcome_text":
+            value = message.text or message.caption
+            if not value or len(value) > 1024:
+                return await render(client, uid, state, "❌ Send text of 1–1024 characters.", navigation())
+            await set_config("welcome_text", value)
+        else:
+            if not message.photo:
+                return await render(client, uid, state, "❌ Send a photo, not a document.", navigation())
+            await set_config("welcome_photo", message.photo.file_id)
+        sessions.pop(uid, None)
+        return await render(client, uid, state, "✅ Welcome message updated. Use Preview to test it.", welcome_menu())
     if step == "force_channel":
         if uid not in ADMIN_IDS:
             return
