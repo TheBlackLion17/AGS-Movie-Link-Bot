@@ -93,6 +93,7 @@ async def setup():
     columns = await query("SHOW COLUMNS FROM registered_groups", mode="all")
     if not any(row["Field"] == "chat_type" for row in columns):
         await query("ALTER TABLE registered_groups ADD COLUMN chat_type VARCHAR(20) NOT NULL DEFAULT 'group'")
+    await query("""CREATE TABLE IF NOT EXISTS bot_settings (setting_key VARCHAR(64) PRIMARY KEY, setting_value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
     # Recover work claimed before an unexpected process restart.
     await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
 
@@ -136,8 +137,6 @@ def keyboard(buttons):
 
 async def check_permission(client, message, target, actor_id=None):
     actor_id = actor_id or message.from_user.id
-    if ADMIN_IDS and actor_id not in ADMIN_IDS:
-        raise ValueError("You are not authorized to use this bot.")
     try:
         me = await client.get_me()
         bot_member = await client.get_chat_member(target, me.id)
@@ -154,6 +153,103 @@ async def check_permission(client, message, target, actor_id=None):
         if not getattr(bot_member.privileges, "can_post_messages", False):
             raise ValueError("The bot needs permission to post messages.")
     return target
+
+
+
+async def force_config():
+    rows = await query("SELECT setting_key,setting_value FROM bot_settings WHERE setting_key IN ('force_enabled','force_chat','force_link')", mode="all")
+    return {row["setting_key"]: row["setting_value"] for row in rows}
+
+
+async def set_config(key, value):
+    await query("INSERT INTO bot_settings (setting_key,setting_value) VALUES (%s,%s) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)", (key, str(value)))
+
+
+async def subscribed(client, user_id):
+    if user_id in ADMIN_IDS:
+        return True
+    cfg = await force_config()
+    if cfg.get("force_enabled") != "1" or not cfg.get("force_chat"):
+        return True
+    try:
+        member = await client.get_chat_member(int(cfg["force_chat"]), user_id)
+        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) or (
+            member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+        )
+    except RPCError:
+        return False
+
+
+async def join_markup():
+    cfg = await force_config()
+    rows = []
+    if cfg.get("force_link"):
+        rows.append([InlineKeyboardButton("📢 Join Required Channel", url=cfg["force_link"])])
+    rows.append([InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="ui:verify")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def join_prompt(message):
+    await message.reply_text(
+        "👋 Welcome to AGS Post Manager!\n\n"
+        "🖼 Create and publish posts\n"
+        "🗓 Schedule posts\n"
+        "🔗 Add URL buttons\n"
+        "👥 Connect your groups and channels\n\n"
+        "🔒 To unlock the bot, join our official channel and tap Check Again.",
+        reply_markup=await join_markup(),
+    )
+
+
+def owner_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 Force Subscribe Settings", callback_data="ui:force")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
+    ])
+
+
+def force_menu(enabled):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Update Required Channel", callback_data="ui:force_update")],
+        [InlineKeyboardButton("🔴 Disable" if enabled else "🟢 Enable", callback_data="ui:force_toggle")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="ui:owner"),
+         InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
+    ])
+
+
+async def force_screen(message):
+    cfg = await force_config()
+    enabled = cfg.get("force_enabled") == "1"
+    await message.reply_text(
+        f"🔒 Force Subscribe: {'Enabled' if enabled else 'Disabled'}\n"
+        f"Required channel: {cfg.get('force_chat') or 'Not configured'}\n\n"
+        "The bot must be an admin of the required channel to check membership.",
+        reply_markup=force_menu(enabled),
+    )
+
+
+async def save_force_channel(client, raw):
+    value = raw.strip()
+    if value.startswith("https://t.me/"):
+        slug = value[len("https://t.me/"):].split("?")[0].strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", slug):
+            raise ValueError("Use a public t.me/username link or -100... channel ID.")
+        target = "@" + slug
+    else:
+        target = parse_target(value)
+    chat = await client.get_chat(target)
+    if chat.type.value != "channel":
+        raise ValueError("The required destination must be a Telegram channel.")
+    me = await client.get_me()
+    bot_member = await client.get_chat_member(chat.id, me.id)
+    if bot_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        raise ValueError("Add the bot as an administrator of that channel first.")
+    link = ("https://t.me/" + chat.username) if chat.username else None
+    if not link:
+        raise ValueError("For private channels, configure a public username first (a join URL is required).")
+    await set_config("force_chat", chat.id)
+    await set_config("force_link", link)
+    return chat.title or link
 
 
 HELP = (
@@ -179,14 +275,16 @@ HELP = (
 @app.on_message(filters.private & filters.command(["start", "help"]))
 async def start(_, message):
     sessions.pop(message.from_user.id, None)
+    if not await subscribed(_, message.from_user.id):
+        return await join_prompt(message)
     await message.reply_text("🛠 AGS Post Manager — choose an action:", reply_markup=main_menu())
 
 
 @app.on_message(filters.private & filters.command("demo"))
 async def demo(client, message):
     """Preview the replied-to media/text post and its URL buttons in private chat."""
-    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("Not authorized.")
+    if not await subscribed(client, message.from_user.id):
+        return await join_prompt(message)
     if not message.reply_to_message:
         return await message.reply_text(
             "Reply to a text, photo, video or document with:\n"
@@ -217,6 +315,8 @@ async def demo(client, message):
 
 @app.on_message(filters.private & filters.command(["buttons", "schedule"]))
 async def create_post(client, message):
+    if not await subscribed(client, message.from_user.id):
+        return await join_prompt(message)
     if not message.reply_to_message:
         return await message.reply_text("Reply to the message you want to publish with this command.\n\n" + HELP)
     try:
@@ -265,9 +365,9 @@ async def create_post(client, message):
 
 
 @app.on_message(filters.private & filters.command("scheduled"))
-async def scheduled_list(_, message):
-    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("Not authorized.")
+async def scheduled_list(client, message):
+    if not await subscribed(client, message.from_user.id):
+        return await join_prompt(message)
     rows = await query(
         """SELECT id,target_chat,scheduled_utc FROM scheduled_posts
         WHERE owner_id=%s AND status='pending'
@@ -285,9 +385,9 @@ async def scheduled_list(_, message):
 
 
 @app.on_message(filters.private & filters.command("cancel"))
-async def cancel(_, message):
-    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("Not authorized.")
+async def cancel(client, message):
+    if not await subscribed(client, message.from_user.id):
+        return await join_prompt(message)
     try:
         job_id = int(message.command[1])
     except (IndexError, ValueError):
@@ -318,7 +418,7 @@ async def register_forwarded_channel(client, message):
     source = getattr(message, "forward_from_chat", None)
     if not source or source.type.value != "channel":
         return
-    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
+    if not await subscribed(client, message.from_user.id):
         return
     try:
         await check_permission(client, message, source.id)
@@ -348,6 +448,8 @@ async def register_group(client, message):
     if not message.from_user:
         return
     try:
+        if not await subscribed(client, message.from_user.id):
+            return await message.reply_text("🔒 Join the required channel through the bot first.")
         await check_permission(client, message, message.chat.id)
         await save_group(message.chat)
         await message.reply_text("✅ Group registered. Select it from the bot's private group picker.")
@@ -413,6 +515,7 @@ def main_menu():
         [InlineKeyboardButton("👥 Groups & Channels", callback_data="ui:groups")],
         [InlineKeyboardButton("➕ Connect Group / Channel", callback_data="ui:connect")],
         [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
+        [InlineKeyboardButton("👑 Owner Settings", callback_data="ui:owner")],
     ])
 
 
@@ -434,10 +537,34 @@ async def menu_click(client, cb):
     user = cb.from_user
     if not user or not cb.message or cb.message.chat.id != user.id:
         return await cb.answer("Open the bot in private chat.", show_alert=True)
-    if ADMIN_IDS and user.id not in ADMIN_IDS:
-        return await cb.answer("Not authorized.", show_alert=True)
-    await cb.answer()
     action = cb.data[3:]
+    if action == "verify":
+        if await subscribed(client, user.id):
+            await cb.answer("Membership verified!")
+            return await cb.message.reply_text("🎉 Access granted! Welcome to AGS Post Manager.", reply_markup=main_menu())
+        await cb.answer("Membership not verified. Please join the channel.", show_alert=True)
+        return
+    if not await subscribed(client, user.id):
+        await cb.answer("Join the required channel first.", show_alert=True)
+        return await join_prompt(cb.message)
+    if action.startswith("force") or action == "owner":
+        if user.id not in ADMIN_IDS:
+            return await cb.answer("Owner only.", show_alert=True)
+        await cb.answer()
+        if action == "owner":
+            return await cb.message.reply_text("👑 Owner Settings", reply_markup=owner_menu())
+        if action == "force":
+            return await force_screen(cb.message)
+        if action == "force_update":
+            sessions[user.id] = {"step": "force_channel"}
+            return await cb.message.reply_text("✏️ Send a public channel @username, https://t.me/username, or -100... channel ID.\nThe bot must already be a channel admin.", reply_markup=cancel_menu())
+        if action == "force_toggle":
+            cfg = await force_config()
+            if cfg.get("force_enabled") != "1" and not cfg.get("force_chat"):
+                return await cb.message.reply_text("❌ Configure a required channel first.", reply_markup=owner_menu())
+            await set_config("force_enabled", "0" if cfg.get("force_enabled") == "1" else "1")
+            return await force_screen(cb.message)
+    await cb.answer()
     state = sessions.get(user.id)
     if action == "home":
         sessions.pop(user.id, None)
@@ -560,8 +687,20 @@ async def menu_input(client, message):
     state = sessions.get(message.from_user.id)
     if not state:
         return
-    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
-        return
+    if state.get("step") == "force_channel":
+        if message.from_user.id not in ADMIN_IDS:
+            return
+        if not message.text:
+            return await message.reply_text("Send a channel username, link or ID.")
+        try:
+            title = await save_force_channel(client, message.text)
+            sessions.pop(message.from_user.id, None)
+            await message.reply_text(f"✅ Required channel updated: {title}")
+            return await force_screen(message)
+        except (ValueError, RPCError) as exc:
+            return await message.reply_text("❌ " + str(exc))
+    if not await subscribed(client, message.from_user.id):
+        return await join_prompt(message)
     step = state["step"]
     if step == "media":
         if not (message.text or message.photo or message.video or message.document):
