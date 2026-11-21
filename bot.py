@@ -614,7 +614,7 @@ async def menu_click(client, cb):
     await cb.answer()
     state = sessions.get(user.id)
     if state and state.get("menu_id") and cb.message.id != state["menu_id"]:
-        return await cb.answer("Use the latest menu.", show_alert=True)
+        return
     if action == "home":
         sessions.pop(user.id, None)
         return await render_cb(client, cb, None, "🏠 AGS Post Manager — choose an action:", main_menu())
@@ -760,7 +760,7 @@ async def menu_click(client, cb):
         return await destination_screen(client, user.id, state)
     if action == "confirm":
         if state.get("step") != "target" or not state.get("targets"):
-            return await cb.answer("Select at least one destination.", show_alert=True)
+            return await render_cb(client, cb, state, "⚠️ Select at least one destination.", navigation([InlineKeyboardButton("👥 Select Destinations", callback_data="ui:refresh")]))
         if state["mode"] == "schedule":
             state["step"] = "date"
             return await render_cb(client, cb, state, f"🕒 Send a future date/time ({TZ}):\nYYYY-MM-DD HH:MM", navigation())
