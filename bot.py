@@ -485,10 +485,7 @@ async def track_bot_membership(client, update):
         active = member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
         await save_group(update.chat, active=active)
         status = "✅ Connected/admin" if active else "❌ Removed or lost admin access"
-        await log_event(client, f"{status}
-👥 {update.chat.title or update.chat.id}
-🆔 {update.chat.id}
-📂 {update.chat.type.value}")
+        await log_event(client, f"{status}\n👥 {update.chat.title or update.chat.id}\n🆔 {update.chat.id}\n📂 {update.chat.type.value}")
     except Exception:
         log.exception("Could not track group membership")
 
