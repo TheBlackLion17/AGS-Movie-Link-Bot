@@ -230,8 +230,8 @@ def owner_menu():
 
 def force_menu(enabled):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Group / Channel", callback_data="ui:force_update")],
-        [InlineKeyboardButton("🗑 Remove Destination", callback_data="ui:force_remove")],
+        [InlineKeyboardButton("➕ Add Destination", callback_data="ui:force_update"),
+         InlineKeyboardButton("🗑 Remove", callback_data="ui:force_remove")],
         [InlineKeyboardButton("🔴 Disable" if enabled else "🟢 Enable", callback_data="ui:force_toggle")],
         [InlineKeyboardButton("⬅️ Back", callback_data="ui:owner"),
          InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
@@ -538,17 +538,17 @@ async def group_picker(client, user_id):
 
 
 def main_menu():
-    rows = [
-        [InlineKeyboardButton("🖼 Create Post", callback_data="ui:create")],
-        [InlineKeyboardButton("🗓 Schedule Post", callback_data="ui:schedule")],
-        [InlineKeyboardButton("👁 Preview Demo", callback_data="ui:demo")],
-        [InlineKeyboardButton("📋 Scheduled Posts", callback_data="ui:list")],
+    """Compact, consistent two-column layout for Telegram mobile screens."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼 Create Post", callback_data="ui:create"),
+         InlineKeyboardButton("🗓 Schedule", callback_data="ui:schedule")],
+        [InlineKeyboardButton("👁 Preview", callback_data="ui:demo"),
+         InlineKeyboardButton("📋 Scheduled Posts", callback_data="ui:list")],
         [InlineKeyboardButton("👥 My Groups & Channels", callback_data="ui:mygroups")],
-        [InlineKeyboardButton("➕ Connect Group / Channel", callback_data="ui:connect")],
-        [InlineKeyboardButton("❓ Help", callback_data="ui:help")],
-    ]
-    rows.append([InlineKeyboardButton("👑 Owner Settings", callback_data="ui:owner")])
-    return InlineKeyboardMarkup(rows)
+        [InlineKeyboardButton("➕ Connect Group", callback_data="ui:connect"),
+         InlineKeyboardButton("❓ Help", callback_data="ui:help")],
+        [InlineKeyboardButton("👑 Owner Settings", callback_data="ui:owner")],
+    ])
 
 
 def navigation(*rows):
@@ -732,10 +732,10 @@ async def menu_click(client, cb):
         return await render_cb(client, cb, state,
             "➕ Connect Group / Channel\n\nChoose Telegram selection or Manual Register.\nThe bot and you must be destination admins.",
             navigation(
-                [InlineKeyboardButton("👥 Select Group", url=f"https://t.me/{me.username}?startgroup=connect")],
-                [InlineKeyboardButton("📢 Select Channel", url=f"https://t.me/{me.username}?startchannel=connect&admin=post_messages")],
+                [InlineKeyboardButton("👥 Add Group", url=f"https://t.me/{me.username}?startgroup=connect"),
+                 InlineKeyboardButton("📢 Add Channel", url=f"https://t.me/{me.username}?startchannel=connect&admin=post_messages")],
                 [InlineKeyboardButton("✍️ Manual Register", callback_data="ui:register")],
-                [InlineKeyboardButton("🔄 Connected Destinations", callback_data="ui:groups")],
+                [InlineKeyboardButton("👥 My Groups & Channels", callback_data="ui:mygroups")],
             ))
     if action == "register":
         state = {"step": "register", "menu_id": cb.message.id}
@@ -902,8 +902,8 @@ async def menu_click_page(client, cb, page):
         return await render_cb(client, cb, None,
             "➕ Connect Group / Channel",
             navigation(
-                [InlineKeyboardButton("👥 Select Group", url=f"https://t.me/{me.username}?startgroup=connect")],
-                [InlineKeyboardButton("📢 Select Channel", url=f"https://t.me/{me.username}?startchannel=connect&admin=post_messages")],
+                [InlineKeyboardButton("👥 Add Group", url=f"https://t.me/{me.username}?startgroup=connect"),
+                 InlineKeyboardButton("📢 Add Channel", url=f"https://t.me/{me.username}?startchannel=connect&admin=post_messages")],
                 [InlineKeyboardButton("✍️ Manual Register", callback_data="ui:register")],
                 [InlineKeyboardButton("🔄 Connected Destinations", callback_data="ui:groups")],
             ))
