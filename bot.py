@@ -94,6 +94,11 @@ async def setup():
     if not any(row["Field"] == "chat_type" for row in columns):
         await query("ALTER TABLE registered_groups ADD COLUMN chat_type VARCHAR(20) NOT NULL DEFAULT 'group'")
     await query("""CREATE TABLE IF NOT EXISTS bot_settings (setting_key VARCHAR(64) PRIMARY KEY, setting_value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+    await query("""CREATE TABLE IF NOT EXISTS force_destinations (chat_id BIGINT PRIMARY KEY, title VARCHAR(255) NOT NULL, chat_type VARCHAR(20) NOT NULL, join_link TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+    legacy = await query("SELECT setting_key,setting_value FROM bot_settings WHERE setting_key IN ('force_chat','force_link')", mode="all")
+    old = {row["setting_key"]: row["setting_value"] for row in legacy}
+    if old.get("force_chat") and old.get("force_link"):
+        await query("INSERT IGNORE INTO force_destinations (chat_id,title,chat_type,join_link) VALUES (%s,%s,%s,%s)", (int(old["force_chat"]), "Previously configured destination", "channel", old["force_link"]))
     # Recover work claimed before an unexpected process restart.
     await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
 
@@ -165,27 +170,38 @@ async def set_config(key, value):
     await query("INSERT INTO bot_settings (setting_key,setting_value) VALUES (%s,%s) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)", (key, str(value)))
 
 
+async def required_destinations():
+    return await query("SELECT chat_id,title,chat_type,join_link FROM force_destinations ORDER BY created_at,chat_id", mode="all")
+
+
 async def subscribed(client, user_id):
     if user_id in ADMIN_IDS:
         return True
     cfg = await force_config()
-    if cfg.get("force_enabled") != "1" or not cfg.get("force_chat"):
+    if cfg.get("force_enabled") != "1":
         return True
-    try:
-        member = await client.get_chat_member(int(cfg["force_chat"]), user_id)
-        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) or (
-            member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
-        )
-    except RPCError:
+    destinations = await required_destinations()
+    if not destinations:
         return False
+    for destination in destinations:
+        try:
+            member = await client.get_chat_member(destination["chat_id"], user_id)
+            valid = member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) or (
+                member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False)
+            )
+            if not valid:
+                return False
+        except RPCError:
+            return False
+    return True
 
 
 async def join_markup():
-    cfg = await force_config()
     rows = []
-    if cfg.get("force_link"):
-        rows.append([InlineKeyboardButton("🔗 Join Required Group / Channel", url=cfg["force_link"])])
-    rows.append([InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="ui:verify")])
+    for destination in (await required_destinations())[:30]:
+        icon = "📢" if destination["chat_type"] == "channel" else "👥"
+        rows.append([InlineKeyboardButton(icon + " " + destination["title"][:45], url=destination["join_link"])])
+    rows.append([InlineKeyboardButton("✅ I've Joined All — Check Again", callback_data="ui:verify")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -196,7 +212,7 @@ async def join_prompt(message):
         "🗓 Schedule posts\n"
         "🔗 Add URL buttons\n"
         "👥 Connect your groups and channels\n\n"
-        "🔒 To unlock the bot, join our required group or channel and tap Check Again.",
+        "🔒 To unlock the bot, join all required groups and channels and tap Check Again.",
         reply_markup=await join_markup(),
     )
 
@@ -210,7 +226,8 @@ def owner_menu():
 
 def force_menu(enabled):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Update Required Channel", callback_data="ui:force_update")],
+        [InlineKeyboardButton("➕ Add Group / Channel", callback_data="ui:force_update")],
+        [InlineKeyboardButton("🗑 Remove Destination", callback_data="ui:force_remove")],
         [InlineKeyboardButton("🔴 Disable" if enabled else "🟢 Enable", callback_data="ui:force_toggle")],
         [InlineKeyboardButton("⬅️ Back", callback_data="ui:owner"),
          InlineKeyboardButton("🏠 Home", callback_data="ui:home")],
@@ -247,8 +264,7 @@ async def save_force_channel(client, raw):
     link = ("https://t.me/" + chat.username) if chat.username else getattr(chat, "invite_link", None)
     if not link or not link.startswith("https://t.me/"):
         raise ValueError("No join link available. Give the group/channel a public username or configure an invite link accessible to the bot.")
-    await set_config("force_chat", chat.id)
-    await set_config("force_link", link)
+    await query("INSERT INTO force_destinations (chat_id,title,chat_type,join_link) VALUES (%s,%s,%s,%s) ON DUPLICATE KEY UPDATE title=VALUES(title),chat_type=VALUES(chat_type),join_link=VALUES(join_link)", (chat.id, (chat.title or "Unnamed")[:255], chat.type.value, link))
     return chat.title or link
 
 
@@ -610,7 +626,7 @@ async def menu_click(client, cb):
     if not await subscribed(client, user.id):
         await cb.answer("Join the required channel first.", show_alert=True)
         return await render_cb(client, cb, sessions.get(user.id),
-                               "🔒 Join our required group or channel to unlock the bot.", await join_markup())
+                               "🔒 Join all required groups and channels to unlock the bot.", await join_markup())
     state = sessions.get(user.id)
     if state and state.get("menu_id") and cb.message.id != state["menu_id"]:
         return await cb.answer("Use the latest menu. Send /start to reset.", show_alert=True)
@@ -629,16 +645,26 @@ async def menu_click(client, cb):
         if action == "force":
             cfg = await force_config()
             enabled = cfg.get("force_enabled") == "1"
+            destinations = await required_destinations()
+            lines = [f"{'📢' if d['chat_type'] == 'channel' else '👥'} {d['title']} ({d['chat_id']})" for d in destinations]
             return await render_cb(client, cb, state,
-                f"🔒 Force Subscribe: {'Enabled' if enabled else 'Disabled'}\nChannel: {cfg.get('force_chat') or 'Not configured'}",
+                f"🔒 Force Subscribe: {'Enabled' if enabled else 'Disabled'}\nRequired destinations: {len(destinations)}\n\n" + ("\n".join(lines[:25]) if lines else "None configured"),
                 force_menu(enabled))
+        if action == "force_remove":
+            destinations = await required_destinations()
+            buttons = [[InlineKeyboardButton("🗑 " + d["title"][:35], callback_data=f"ui:forcedel:{d['chat_id']}")] for d in destinations[:30]]
+            return await render_cb(client, cb, state, "🗑 Select a required destination to remove:", navigation(*buttons))
+        if action.startswith("forcedel:"):
+            chat_id = int(action.split(":", 1)[1])
+            await query("DELETE FROM force_destinations WHERE chat_id=%s", (chat_id,))
+            return await render_cb(client, cb, state, "✅ Destination removed.", force_menu((await force_config()).get("force_enabled") == "1"))
         if action == "force_update":
             sessions[user.id] = {"step": "force_channel", "menu_id": cb.message.id}
             return await render_cb(client, cb, sessions[user.id],
-                "✏️ Send a group or channel @username, https://t.me/username, or -100... ID.\nThe bot must be a group/channel admin.", cancel_menu())
+                "➕ Send a group or channel @username, https://t.me/username, or -100... ID.\nThe bot must be a group/channel admin.", cancel_menu())
         if action == "force_toggle":
             cfg = await force_config()
-            if cfg.get("force_enabled") != "1" and not cfg.get("force_chat"):
+            if cfg.get("force_enabled") != "1" and not await required_destinations():
                 return await render_cb(client, cb, state, "❌ Configure a channel first.", owner_menu())
             enabled = cfg.get("force_enabled") != "1"
             await set_config("force_enabled", "1" if enabled else "0")
@@ -824,7 +850,7 @@ async def menu_input(client, message):
         try:
             title = await save_force_channel(client, message.text)
             sessions.pop(uid, None)
-            return await render(client, uid, state, f"✅ Required channel updated: {title}", owner_menu())
+            return await render(client, uid, state, f"✅ Required destination added: {title}\nYou can add more groups or channels from Force Subscribe Settings.", owner_menu())
         except (ValueError, RPCError) as exc:
             return await render(client, uid, state, "❌ " + str(exc), navigation())
     if not await subscribed(client, uid):
