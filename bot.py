@@ -45,6 +45,7 @@ app = Client(
 )
 pool = None
 sessions = {}
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0") or "0")
 
 
 async def query(statement, params=(), mode=None):
@@ -99,6 +100,7 @@ async def setup():
     old = {row["setting_key"]: row["setting_value"] for row in legacy}
     if old.get("force_chat") and old.get("force_link"):
         await query("INSERT IGNORE INTO force_destinations (chat_id,title,chat_type,join_link) VALUES (%s,%s,%s,%s)", (int(old["force_chat"]), "Previously configured destination", "channel", old["force_link"]))
+    await query("""CREATE TABLE IF NOT EXISTS bot_users (user_id BIGINT PRIMARY KEY, username VARCHAR(255), first_name VARCHAR(255), first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, start_count INT NOT NULL DEFAULT 1) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
     # Recover work claimed before an unexpected process restart.
     await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
 
@@ -288,10 +290,37 @@ HELP = (
 )
 
 
+async def log_event(client, text):
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        await client.send_message(LOG_CHANNEL_ID, text, disable_web_page_preview=True)
+    except Exception:
+        log.exception("Log channel delivery failed (check LOG_CHANNEL_ID and bot posting rights)")
+
+
+async def heartbeat(client):
+    while True:
+        await asyncio.sleep(21600)
+        try:
+            users = await query("SELECT COUNT(*) AS total FROM bot_users", mode="one")
+            groups = await query("SELECT COUNT(*) AS total FROM registered_groups WHERE active=1", mode="one")
+            await log_event(client, f"💚 AGS Post Manager is alive\n👤 Users: {users['total']}\n👥 Connected groups/channels: {groups['total']}\n🕒 {datetime.now(TZ):%Y-%m-%d %H:%M} ({TZ})")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Heartbeat failed")
+
+
 @app.on_message(filters.private & filters.command(["start", "help"]))
 async def start(_, message):
-    sessions.pop(message.from_user.id, None)
-    if not await subscribed(_, message.from_user.id):
+    user = message.from_user
+    previous = await query("SELECT user_id,start_count FROM bot_users WHERE user_id=%s", (user.id,), mode="one")
+    await query("INSERT INTO bot_users (user_id,username,first_name) VALUES (%s,%s,%s) ON DUPLICATE KEY UPDATE username=VALUES(username),first_name=VALUES(first_name),start_count=start_count+1", (user.id, user.username, user.first_name))
+    label = ("🆕 New user started bot" if not previous else "🔄 Returning user started bot")
+    await log_event(_, f"{label}\n👤 {user.first_name or 'Unknown'}\n🆔 {user.id}\n🔗 @{user.username}" if user.username else f"{label}\n👤 {user.first_name or 'Unknown'}\n🆔 {user.id}")
+    sessions.pop(user.id, None)
+    if not await subscribed(_, user.id):
         return await join_prompt(message)
     await message.reply_text("🛠 AGS Post Manager — choose an action:", reply_markup=main_menu())
 
@@ -455,6 +484,11 @@ async def track_bot_membership(client, update):
             return
         active = member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
         await save_group(update.chat, active=active)
+        status = "✅ Connected/admin" if active else "❌ Removed or lost admin access"
+        await log_event(client, f"{status}
+👥 {update.chat.title or update.chat.id}
+🆔 {update.chat.id}
+📂 {update.chat.type.value}")
     except Exception:
         log.exception("Could not track group membership")
 
@@ -468,6 +502,7 @@ async def register_group(client, message):
             return await message.reply_text("🔒 Join the required channel through the bot first.")
         await check_permission(client, message, message.chat.id)
         await save_group(message.chat)
+        await log_event(client, f"📝 Destination registered\n👥 {message.chat.title or message.chat.id}\n🆔 {message.chat.id}\n👤 Registered by {message.from_user.id}")
         await message.reply_text("✅ Group registered. Select it from the bot's private group picker.")
     except (ValueError, RPCError) as exc:
         await message.reply_text("❌ " + str(exc))
@@ -970,13 +1005,24 @@ async def scheduler():
 async def main():
     await setup()
     task = None
+    heartbeat_task = None
     try:
         await app.start()
         me = await app.get_me()
         log.info("Button Creator & Post Scheduler started: @%s", me.username)
+        await log_event(app, f"🟢 AGS Post Manager ONLINE\n🤖 @{me.username}\n🕒 {datetime.now(TZ):%Y-%m-%d %H:%M} ({TZ})")
         task = asyncio.create_task(scheduler())
+        heartbeat_task = asyncio.create_task(heartbeat(app))
         await idle()
     finally:
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        if app.is_connected:
+            await log_event(app, "🔴 AGS Post Manager stopping (graceful shutdown).")
         if task:
             task.cancel()
             try:
