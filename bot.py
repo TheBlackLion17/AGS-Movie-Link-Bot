@@ -611,16 +611,19 @@ async def menu_click(client, cb):
         await cb.answer("Join the required channel first.", show_alert=True)
         return await render_cb(client, cb, sessions.get(user.id),
                                "🔒 Join our official channel to unlock the bot.", await join_markup())
-    await cb.answer()
     state = sessions.get(user.id)
     if state and state.get("menu_id") and cb.message.id != state["menu_id"]:
-        return
+        return await cb.answer("Use the latest menu. Send /start to reset.", show_alert=True)
+    await cb.answer()
     if action == "home":
         sessions.pop(user.id, None)
         return await render_cb(client, cb, None, "🏠 AGS Post Manager — choose an action:", main_menu())
     if action == "owner" or action.startswith("force"):
         if user.id not in ADMIN_IDS:
-            return await cb.answer("Owner only.", show_alert=True)
+            return await render_cb(client, cb, state,
+                "🔐 Owner Settings are restricted.\n\nYour Telegram user ID: " + str(user.id) +
+                "\nAdd this ID to ADMIN_IDS in the VPS .env file, then restart the bot.",
+                navigation())
         if action == "owner":
             return await render_cb(client, cb, state, "👑 Owner Settings", owner_menu())
         if action == "force":
