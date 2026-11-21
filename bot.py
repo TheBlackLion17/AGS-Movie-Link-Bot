@@ -101,6 +101,7 @@ async def setup():
     if old.get("force_chat") and old.get("force_link"):
         await query("INSERT IGNORE INTO force_destinations (chat_id,title,chat_type,join_link) VALUES (%s,%s,%s,%s)", (int(old["force_chat"]), "Previously configured destination", "channel", old["force_link"]))
     await query("""CREATE TABLE IF NOT EXISTS bot_users (user_id BIGINT PRIMARY KEY, username VARCHAR(255), first_name VARCHAR(255), first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, start_count INT NOT NULL DEFAULT 1) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+    await query("""CREATE TABLE IF NOT EXISTS user_destinations (user_id BIGINT NOT NULL, chat_id BIGINT NOT NULL, connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,chat_id), INDEX idx_chat(chat_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
     await query("""CREATE TABLE IF NOT EXISTS user_hidden_destinations (user_id BIGINT NOT NULL, chat_id BIGINT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,chat_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
     # Recover work claimed before an unexpected process restart.
     await query("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
@@ -448,6 +449,11 @@ async def cancel(client, message):
 
 
 
+async def connect_user_destination(user_id, chat_id):
+    await query("INSERT IGNORE INTO user_destinations (user_id,chat_id) VALUES (%s,%s)", (user_id,chat_id))
+    await query("DELETE FROM user_hidden_destinations WHERE user_id=%s AND chat_id=%s", (user_id,chat_id))
+
+
 async def save_group(chat, active=True):
     if chat.type.value not in ("group", "supergroup", "channel"):
         return
@@ -469,7 +475,7 @@ async def register_forwarded_channel(client, message):
     try:
         await check_permission(client, message, source.id)
         await save_group(source)
-        await query("DELETE FROM user_hidden_destinations WHERE user_id=%s AND chat_id=%s", (message.from_user.id, source.id))
+        await connect_user_destination(message.from_user.id, source.id)
         await message.reply_text("✅ Channel connected! Open Groups & Channels to select it.")
     except (ValueError, RPCError) as exc:
         await message.reply_text("❌ Channel not connected: " + str(exc))
@@ -501,7 +507,7 @@ async def register_group(client, message):
             return await message.reply_text("🔒 Join the required channel through the bot first.")
         await check_permission(client, message, message.chat.id)
         await save_group(message.chat)
-        await query("DELETE FROM user_hidden_destinations WHERE user_id=%s AND chat_id=%s", (message.from_user.id, message.chat.id))
+        await connect_user_destination(message.from_user.id, message.chat.id)
         await log_event(client, f"📝 Destination registered\n👥 {message.chat.title or message.chat.id}\n🆔 {message.chat.id}\n👤 Registered by {message.from_user.id}")
         await message.reply_text("✅ Group registered. Select it from the bot's private group picker.")
     except (ValueError, RPCError) as exc:
@@ -510,8 +516,8 @@ async def register_group(client, message):
 
 async def group_picker(client, user_id):
     rows = await query(
-        "SELECT chat_id,title,chat_type FROM registered_groups WHERE active=1 ORDER BY title LIMIT 80",
-        mode="all",
+        "SELECT g.chat_id,g.title,g.chat_type FROM registered_groups g JOIN user_destinations u ON u.chat_id=g.chat_id WHERE g.active=1 AND u.user_id=%s ORDER BY g.title LIMIT 80",
+        (user_id,), mode="all",
     )
     available = []
     me = await client.get_me()
@@ -753,7 +759,7 @@ async def menu_click(client, cb):
             [InlineKeyboardButton("✍️ Manual Register", callback_data="ui:register")],
         ]
         return await render_cb(client, cb, state,
-            f"👥 My Groups & Channels\nConnected destinations you administer: {len(groups)}\n\nSelect a destination to manage it.",
+            f"👥 My Groups & Channels\nYour connected destinations: {len(groups)}\n\nOnly groups/channels you personally register appear here. Existing connections may need to be registered again.",
             navigation(*buttons))
     if action.startswith("disconnect:"):
         target = int(action.split(":", 1)[1])
@@ -761,7 +767,7 @@ async def menu_click(client, cb):
             await check_permission(client, cb.message, target, actor_id=user.id)
         except (ValueError, RPCError) as exc:
             return await render_cb(client, cb, state, "❌ " + str(exc), navigation())
-        await query("INSERT IGNORE INTO user_hidden_destinations (user_id,chat_id) VALUES (%s,%s)", (user.id,target))
+        await query("DELETE FROM user_destinations WHERE user_id=%s AND chat_id=%s", (user.id,target))
         await log_event(client, f"🔌 User disconnected destination from dashboard\n👤 {user.id}\n👥 {target}")
         return await render_cb(client, cb, state, "✅ Destination removed from your dashboard. Other administrators are unaffected. Register it again to reconnect.", navigation([InlineKeyboardButton("👥 My Groups", callback_data="ui:mygroups")]))
     if action == "groups" or action == "refresh":
@@ -772,7 +778,7 @@ async def menu_click(client, cb):
         return
     if action.startswith("detail:"):
         target = int(action.split(":", 1)[1])
-        row = await query("SELECT title,chat_type,active FROM registered_groups WHERE chat_id=%s", (target,), mode="one")
+        row = await query("SELECT g.title,g.chat_type,g.active FROM registered_groups g JOIN user_destinations u ON u.chat_id=g.chat_id WHERE g.chat_id=%s AND u.user_id=%s", (target,user.id), mode="one")
         if not row or not row["active"]:
             return await render_cb(client, cb, state, "❌ Destination unavailable.", navigation())
         try:
@@ -939,6 +945,7 @@ async def menu_input(client, message):
             await check_permission(client, message, target)
             chat = await client.get_chat(target)
             await save_group(chat)
+            await connect_user_destination(uid, chat.id)
             sessions.pop(uid, None)
             return await render(client, uid, state,
                 f"✅ Registered: {chat.title}\nID: {chat.id}", main_menu())
